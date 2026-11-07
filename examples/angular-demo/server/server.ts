@@ -5,6 +5,7 @@
 //        -> { id, manifest, report, sizes }
 //   GET  /api/decks/:id/assemble?range=2-4          -> application/pdf
 //   GET  /store/:id/<file>                          -> stored fragment / manifest
+//   GET  /metrics                                   -> Prometheus text format
 //
 // Run with: node server/server.ts   (Node 23+ strips the types natively)
 
@@ -16,6 +17,7 @@ import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { join, normalize } from "node:path";
 import { randomUUID } from "node:crypto";
+import { createMetrics, outcomeOfCode, type Outcome } from "./metrics.ts";
 import { createPool, verifyFragment, SlidepdfError, type Preset, type Manifest } from "slidepdf";
 
 const PORT = Number(process.env.PORT ?? 3001);
@@ -24,6 +26,7 @@ const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB ?? 500);
 const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
 // Decks with more slides than this are refused up front, before taking a worker.
 const MAX_SLIDES = Number(process.env.MAX_SLIDES ?? 500);
+const RECYCLE_MB = 64;
 
 // Conversions run in worker threads with a hard budget each, so a bad deck
 // fails on its own and the process memory stays at roughly
@@ -32,8 +35,16 @@ const pool = createPool({
   size: Number(process.env.WORKERS ?? 2),
   memoryMb: Number(process.env.MEMORY_MB ?? 256),
   timeoutMs: Number(process.env.TIMEOUT_MS ?? 120_000),
-  recycleAboveMb: 64,
+  recycleAboveMb: RECYCLE_MB,
 });
+
+const metrics = createMetrics(RECYCLE_MB);
+
+/** Maps a conversion failure to its outcome label. */
+function outcomeOf(e: unknown): Outcome {
+  if (e instanceof HttpError) return "invalid";
+  return e instanceof SlidepdfError ? outcomeOfCode(e.code) : "error";
+}
 
 /** Streams the upload to disk so a large deck never sits in memory. */
 async function saveUpload(req: IncomingMessage, dest: string): Promise<number> {
@@ -90,6 +101,11 @@ const deckDir = (id: string) => {
 async function handle(req: IncomingMessage, res: ServerResponse) {
   const url = new URL(req.url ?? "/", "http://localhost");
 
+  if (req.method === "GET" && url.pathname === "/metrics") {
+    res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
+    return res.end(metrics.render(pool.stats()));
+  }
+
   if (req.method === "POST" && url.pathname === "/api/convert") {
     const preset = (url.searchParams.get("preset") ?? "balanced") as Preset;
     const name = url.searchParams.get("name") ?? "deck.pptx";
@@ -97,7 +113,19 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     const dir = deckDir(id);
     await mkdir(dir, { recursive: true });
     const upload = join(dir, "source.pptx");
-    const pptxBytes = await saveUpload(req, upload);
+    const started = performance.now();
+    const endUpload = metrics.track();
+    let pptxBytes;
+    try {
+      pptxBytes = await saveUpload(req, upload);
+    } catch (e) {
+      await rm(dir, { recursive: true, force: true });
+      metrics.record(req.destroyed ? "aborted" : outcomeOf(e), (performance.now() - started) / 1000);
+      throw e;
+    } finally {
+      endUpload();
+    }
+    const endConvert = metrics.track();
     let out;
     try {
       // Preflight in milliseconds: refuse oversized decks before converting.
@@ -107,14 +135,18 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
       out = await pool.convertFile(upload, dir, { preset, sourceName: name, signal: AbortSignal.any([abortOnClose(req)]) });
     } catch (e) {
       await rm(dir, { recursive: true, force: true });
+      metrics.record(outcomeOf(e), (performance.now() - started) / 1000, e instanceof SlidepdfError ? e.peakBytes : undefined);
       if (e instanceof HttpError) throw e;
       const err = e as SlidepdfError;
       // Each failure code maps to a status the client can act on.
       const status = { memory: 413, timeout: 408, aborted: 499, convert: 422 }[err.code] ?? 500;
       throw new HttpError(status, `could not convert (${err.code}): ${err.message}`);
     } finally {
+      endConvert();
       await rm(upload, { force: true });
     }
+    metrics.record("ok", (performance.now() - started) / 1000, out.stats.peakBytes);
+    metrics.converted(out.stats.slides, out.stats.inputBytes);
     const ms = Math.round(out.stats.ms);
     const fragmentBytes = out.manifest.slides.reduce((s, f) => s + f.bytes, 0);
     const pdfBytes = (await stat(join(dir, "deck.pdf"))).size;
