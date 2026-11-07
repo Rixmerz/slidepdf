@@ -1,6 +1,6 @@
 [package]
 name = "slidepdf"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Ultra-light PPTX to PDF converter with per-slide PDF fragments that can be stored, reassembled and viewed as slices"
 license = "MIT OR Apache-2.0"

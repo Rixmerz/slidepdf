@@ -16,6 +16,7 @@
 //! The core does no I/O: bytes in, bytes out. That keeps the WASM and
 //! native wrappers thin.
 
+mod chart;
 pub mod fonts;
 pub mod fragments;
 pub mod images;

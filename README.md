@@ -149,8 +149,8 @@ Two builds ship in the package:
 
 | Import | Includes | .wasm | gzipped |
 |---|---|---|---|
-| `slidepdf` | everything | 1.5 MB | 644 KB |
-| `slidepdf/lite` | conversion only (no font embedding, no `assemble`/`split`) | 631 KB | 295 KB |
+| `slidepdf` | everything | 1.5 MB | 659 KB |
+| `slidepdf/lite` | conversion only (no font embedding, no `assemble`/`split`) | 671 KB | 310 KB |
 
 Tested in Node and Chromium. Cloudflare Workers is expected to work with
 `slidepdf/lite` (pass the imported `.wasm` module to `ready()`), but has not
@@ -209,11 +209,14 @@ solid, translucent, linear and radial gradient, and picture fills, including
 theme fill styles; about 60 preset shapes and custom geometry; rotation and
 flips; groups; pictures (JPEG, PNG and GIF with transparency, cropping);
 tables with the styles defined in the deck; backgrounds; slide numbers;
-SmartArt (from the drawing PowerPoint saves with it); previews of embedded
+SmartArt (from the drawing PowerPoint saves with it); charts (columns, bars,
+lines, areas, pies, doughnuts and scatter, redrawn from the data cached in the
+deck; 3D charts are drawn flat); previews of embedded
 objects (Excel, Word...); and any content wrapped in `mc:AlternateContent`
 with a fallback picture (equations, some icons). Hidden shapes are skipped.
 
-Not supported yet (reported per slide): charts, SmartArt saved without its
+Not supported yet (reported per slide): radar, bubble, stock and surface
+charts (drawn as line charts), SmartArt saved without its
 drawing, EMF/WMF/SVG/TIFF images, built-in Office table styles that the deck
 does not define (a default look is used), rotated groups, shadows
 and effects, animations and transitions. Text layout is close to PowerPoint

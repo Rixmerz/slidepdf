@@ -6,6 +6,20 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-07
+
+### Added
+
+- Charts are drawn from the data cached in the deck: clustered, stacked and
+  100% stacked columns and bars, lines (with markers), areas, pies, doughnuts
+  and scatter plots, with titles, legends, axes with rounded scales,
+  gridlines, data labels, per-point and per-series colors, gap and overlap
+  like Office, and the chart's own background (color, picture or texture).
+  3D charts are drawn flat and reported. In the 539-deck test corpus no chart
+  is skipped any more (25 before).
+
+## [0.1.0] - 2026-11-06
+
 ### Added
 
 - PPTX to PDF conversion with slide, layout, master and theme inheritance:

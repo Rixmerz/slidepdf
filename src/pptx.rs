@@ -1870,7 +1870,10 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
                 _ => self.warn("embedded object skipped (no preview picture)"),
             }
         } else if uri.ends_with("/chart") {
-            self.warn("chart skipped (no fallback image)");
+            let Some(x) = n.child("xfrm").and_then(parse_xfrm) else { return };
+            if !self.chart(data, part, xf.rect(x.rect)) {
+                self.warn("chart skipped (no cached data)");
+            }
         } else if uri.ends_with("/diagram") {
             let Some(x) = n.child("xfrm").and_then(parse_xfrm) else { return };
             if !self.smartart(data, part, xf, x.rect) {
@@ -1879,6 +1882,58 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         } else {
             self.warn(format!("graphic frame '{uri}' skipped"));
         }
+    }
+
+    /// Charts are redrawn from the values cached in the chart part.
+    fn chart(&mut self, data: &Node, part: &Part, frame: Rect) -> bool {
+        let Some(path) = data
+            .child("chart")
+            .and_then(|c| c.attr("r:id"))
+            .and_then(|id| part.rels.get(id))
+            .map(|r| r.target.clone())
+        else {
+            return false;
+        };
+        let Some(root) = self.pkg.xml(&path) else { return false };
+        let cc = self.cc();
+        let Some(chart) = crate::chart::parse(&root, &|fill: &Node| cc.color_in(fill)) else {
+            return false;
+        };
+        // The chart's own background (solid, gradient, picture or texture).
+        if let Some(sp) = root.child("spPr") {
+            let rels = self.pkg.rels(&path);
+            let chart_part = Part {
+                root: Node::default(),
+                rels,
+            };
+            if let Some(FillSpec::Some(fill)) = self.fill(sp, &chart_part, &cc) {
+                self.elements.push(Element::Shape(Shape {
+                    rect: frame,
+                    rotation: 0.0,
+                    flip_h: false,
+                    flip_v: false,
+                    geometry: Geometry::Rect,
+                    fill: Some(fill),
+                    stroke: None,
+                    text: None,
+                    is_title: false,
+                    text_rect: None,
+                }));
+            }
+        }
+        for note in &chart.notes {
+            self.warn(note.clone());
+        }
+        let accents: Vec<Rgb> = (1..=6)
+            .filter_map(|i| self.theme.colors.get(&format!("accent{i}")).copied())
+            .collect();
+        let style = crate::chart::Style {
+            accents: &accents,
+            face: &self.theme.minor,
+        };
+        let elements = crate::chart::layout(&chart, frame, &style);
+        self.elements.extend(elements);
+        true
     }
 
     /// SmartArt: PowerPoint saves a pre-laid-out copy (`diagrams/drawingN.xml`)
