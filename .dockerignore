@@ -1,0 +1,8 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src/
+!viewer/slide-viewer.js
+!viewer/index.html
+!bindings/wasm/Cargo.toml
+!bindings/wasm/src/

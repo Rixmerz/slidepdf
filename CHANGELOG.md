@@ -6,6 +6,46 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-07
+
+Scalability release: everything a converter needs to run predictably inside
+memory-limited pods. No change to the PDFs produced.
+
+### Added
+
+- A memory budget: `slidepdf::budget` is a counting allocator (installed by
+  the CLI and the WebAssembly bindings; library users opt in) with a hard
+  cap. `--memory-limit <mb>` in the CLI aborts with exit code 134 and a
+  message on stderr; in npm, `setMemoryLimit(mb)` and the pool's `memoryMb`
+  fail the conversion with code `memory` and leave the process up (Node
+  reloads the instance). `memoryStats()` and `stats.peakBytes` report the
+  peak; the CLI prints it in its summary.
+- Timeouts and cancellation: `--timeout <seconds>` in the CLI (exit code
+  124); `convert_stream_with` takes a progress hook that can stop the
+  conversion after any slide; in npm, `timeoutMs`, `signal` (an
+  `AbortSignal`) and `onProgress` on `convertStream`, `convertFile` and the
+  pool, with codes `timeout`, `aborted` and `cancelled`.
+- A worker pool for Node: `createPool({ size, memoryMb, timeoutMs,
+  recycleAboveMb })` runs conversions in worker threads, queues the rest,
+  replaces workers whose WebAssembly memory grew past the cap, and compiles
+  the module once, eagerly, so a fresh worker is as fast as a warm one.
+  `convertFileInWorker` for one-off jobs. `pool.stats()` for metrics.
+- `inspect` / `inspectFile` / `slidepdf inspect`: slide count, page size,
+  part and media bytes from the zip directory alone, in milliseconds, to
+  route or refuse a deck before converting it.
+- `SlidepdfError` with a stable `code` on every failure in npm; `stats`
+  (`ms`, `peakBytes`, `slides`, `inputBytes`) on every conversion result.
+- `--quiet` in the CLI.
+- A `Dockerfile` that builds a scratch image (about 3 MB) with the CLI.
+- The demo server converts through the pool, refuses decks over a slide
+  limit after `inspectFile`, cancels when the client disconnects and maps
+  error codes to HTTP statuses.
+
+### Changed
+
+- `convertStreamRaw` (the raw WebAssembly export) takes an optional
+  `onProgress` argument; the typed API is unchanged apart from the additions.
+
 ## [0.2.0] - 2026-11-07
 
 ### Added

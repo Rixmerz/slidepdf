@@ -3,9 +3,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { convert, assemble, split, verifyFragment, search } from "../node.js";
 
-const deck = process.env.SLIDEPDF_TEST_PPTX;
+import { existsSync } from "node:fs";
 
-test("converts, fragments, reassembles and splits", { skip: !deck && "set SLIDEPDF_TEST_PPTX" }, () => {
+// The repo fixture, or any deck given through the environment.
+const deck = process.env.SLIDEPDF_TEST_PPTX ?? new URL("../../tests/fixtures/deck.pptx", import.meta.url).pathname;
+
+test("converts, fragments, reassembles and splits", { skip: !existsSync(deck) && "set SLIDEPDF_TEST_PPTX" }, () => {
   const out = convert(readFileSync(deck), { preset: "light" });
   assert.ok(out.pdf.length > 0);
   assert.equal(out.fragments.length, out.manifest.count);

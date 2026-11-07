@@ -16,6 +16,7 @@
 //! The core does no I/O: bytes in, bytes out. That keeps the WASM and
 //! native wrappers thin.
 
+pub mod budget;
 mod chart;
 pub mod fonts;
 pub mod fragments;
@@ -31,6 +32,7 @@ pub use fonts::FontFile;
 pub use fragments::{Entry, Fragment, Manifest};
 
 pub use ir::{Deck, Warning};
+pub use pptx::Inspection;
 use std::io::{Cursor, Read, Seek, Write};
 
 #[derive(Debug, Clone)]
@@ -215,6 +217,23 @@ pub struct Summary {
     pub report: Report,
 }
 
+/// Sizes up a package in milliseconds, without converting it: slide count,
+/// page size and media bytes. See [`Inspection`].
+pub fn inspect<R: Read + Seek>(input: R) -> Result<Inspection, Error> {
+    Ok(pptx::inspect(&mut pptx::Package::open(input)?)?)
+}
+
+/// Where a streaming conversion is, reported after each slide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// Slides finished so far.
+    pub done: usize,
+    pub total: usize,
+}
+
+/// The error a cancelled conversion returns (see [`convert_stream_with`]).
+pub const CANCELLED: &str = "conversion cancelled";
+
 /// Parses a PPTX into the intermediate representation.
 pub fn parse(pptx: &[u8], include_hidden: bool) -> Result<Deck, Error> {
     Ok(pptx::parse(pptx, &pptx::ParseOptions { include_hidden })?)
@@ -248,6 +267,20 @@ pub fn convert_stream<R: Read + Seek>(
     opts: &Options,
     full_pdf: Option<&mut dyn Write>,
     on_fragment: &mut dyn FnMut(Fragment) -> Result<(), String>,
+) -> Result<Summary, Error> {
+    convert_stream_with(input, opts, full_pdf, on_fragment, &mut |_| true)
+}
+
+/// [`convert_stream`] with a progress hook, called after every slide.
+/// Returning `false` stops the conversion with an error whose message is
+/// [`CANCELLED`]: that is how a server enforces a deadline, or an abort
+/// signal, without killing the process or the WebAssembly instance.
+pub fn convert_stream_with<R: Read + Seek>(
+    input: R,
+    opts: &Options,
+    full_pdf: Option<&mut dyn Write>,
+    on_fragment: &mut dyn FnMut(Fragment) -> Result<(), String>,
+    on_progress: &mut dyn FnMut(Progress) -> bool,
 ) -> Result<Summary, Error> {
     let mut pkg = pptx::Package::open(input)?;
     let deck = pptx::parse_package(
@@ -300,6 +333,12 @@ pub fn convert_stream<R: Read + Seek>(
             };
             entries.push(f.entry());
             on_fragment(f).map_err(Error)?;
+        }
+        if !on_progress(Progress {
+            done: i + 1,
+            total: deck.slides.len(),
+        }) {
+            return Err(Error(CANCELLED.into()));
         }
     }
     if let Some(d) = doc {

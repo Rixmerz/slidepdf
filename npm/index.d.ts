@@ -20,6 +20,62 @@ export interface ConvertOptions {
   sourceName?: string;
   /** Memory (MB) for reusing prepared images across slides. Default 16. */
   cacheMb?: number;
+  /**
+   * Stop with code "timeout" once the conversion has run this long. Checked
+   * after every slide, so the overrun is at most one slide.
+   */
+  timeoutMs?: number;
+  /** Stop with code "aborted" after the current slide once this fires. */
+  signal?: AbortSignal;
+}
+
+export interface ConversionStats {
+  /** Wall time of the conversion. */
+  ms: number;
+  /** Highest heap use during the conversion. */
+  peakBytes: number;
+  slides: number;
+  inputBytes: number;
+}
+
+/** What `inspect` learns from the zip directory and presentation.xml alone. */
+export interface Inspection {
+  /** Slides listed by the presentation, hidden ones included. */
+  slides: number;
+  /** Page size in PDF points. */
+  width: number;
+  height: number;
+  parts: number;
+  /** Declared uncompressed size of every part. */
+  bytes: number;
+  media: number;
+  mediaBytes: number;
+  /** The biggest media part: the one that drives peak memory. */
+  largestMediaBytes: number;
+  largestMedia: string;
+  embeddedFonts: number;
+}
+
+export type SlidepdfErrorCode =
+  /** The deck could not be converted (not a PPTX, corrupt, over the hard limits). */
+  | "convert"
+  /** The memory limit was exceeded; `peakBytes` and `limitBytes` are set. */
+  | "memory"
+  | "timeout"
+  | "aborted"
+  /** The progress callback returned false. */
+  | "cancelled"
+  /** The WebAssembly instance trapped for another reason (a bug: please report it). */
+  | "trap"
+  /** Pool only: the worker thread crashed or was killed. */
+  | "worker"
+  /** Pool only: the pool was closed. */
+  | "closed";
+
+export class SlidepdfError extends Error {
+  code: SlidepdfErrorCode;
+  peakBytes?: number;
+  limitBytes?: number;
 }
 
 /** Random-access input, so large decks never have to be loaded whole. */
@@ -39,12 +95,17 @@ export interface StreamCallbacks {
    * it out synchronously or copy it. Default false.
    */
   zeroCopy?: boolean;
+  /** Called after every slide. */
+  onProgress?: (done: number, total: number) => void;
+  /** Polled after every slide; returning true stops with code "cancelled". */
+  shouldCancel?: () => boolean;
 }
 
 export interface StreamResult {
   manifest: Manifest;
   manifestJson: string;
   report: Report;
+  stats: ConversionStats;
 }
 
 export interface Fragment {
@@ -101,6 +162,7 @@ export interface Conversion {
   /** The manifest exactly as it should be stored (manifest.json). */
   manifestJson: string;
   report: Report;
+  stats: ConversionStats;
 }
 
 /** Loads the WebAssembly module. Required once in browsers/Workers; a no-op in Node. */
@@ -116,7 +178,78 @@ export function convert(pptx: Bytes, options?: ConvertOptions): Conversion;
 export function convertStream(source: ByteSource | Bytes, options: ConvertOptions, callbacks: StreamCallbacks): StreamResult;
 
 /** Node only: converts a .pptx file into `outDir` (slide-NNN.pdf, deck.pdf, manifest.json, report.json) with bounded memory. */
-export function convertFile(input: string, outDir: string, options?: ConvertOptions): StreamResult;
+export function convertFile(input: string, outDir: string, options?: ConvertOptions & { onProgress?: (done: number, total: number) => void }): StreamResult;
+
+/** Sizes up a deck in milliseconds without converting it, to decide its queue or refuse it. */
+export function inspect(pptx: ByteSource | Bytes): Inspection;
+
+/** Node only: `inspect` on a .pptx file. */
+export function inspectFile(input: string): Inspection;
+
+/**
+ * Caps the heap of this WebAssembly instance at `mb` megabytes (0 removes
+ * the cap). A conversion that exceeds it fails with code "memory". In
+ * Node the instance is reloaded afterwards; in browsers and Workers it is
+ * dead, so only set a limit where the isolate can be thrown away.
+ */
+export function setMemoryLimit(mb: number): void;
+
+/** Heap bytes in use, the peak of the last conversion, the cap, and the size of WebAssembly memory (which only grows). */
+export function memoryStats(): { inUse: number; peak: number; limit: number; linear: number };
+
+export interface JobOptions {
+  /** Overrides the pool's timeoutMs for this job. */
+  timeoutMs?: number;
+  /** Overrides the pool's memoryMb for this job. */
+  memoryMb?: number;
+  signal?: AbortSignal;
+  onProgress?: (done: number, total: number) => void;
+}
+
+export interface PoolOptions {
+  /** Worker threads, so also the number of conversions in flight. Default 1. */
+  size?: number;
+  /** Default timeout per job; 0 (default) is none. */
+  timeoutMs?: number;
+  /** Default heap cap per job in MB; 0 (default) is none. */
+  memoryMb?: number;
+  /**
+   * Replace a worker once its WebAssembly memory passed this (MB). Memory
+   * never shrinks inside a worker, so this bounds what idle workers keep.
+   * A replacement costs about 15 ms. Default 64.
+   */
+  recycleAboveMb?: number;
+  /** After a timeout or abort, how long a worker may take to stop on its own before it is killed. Default 5000. */
+  killGraceMs?: number;
+  /** Compile the whole module up front so the first conversion is as fast as the rest (sets a process-wide V8 flag). Default true. */
+  eagerCompile?: boolean;
+}
+
+export interface PoolStats {
+  size: number;
+  workers: number;
+  busy: number;
+  queued: number;
+  /** Highest WebAssembly memory (MB) each live worker reached. */
+  highMb: number[];
+}
+
+/** Node only: worker threads with a memory cap, a timeout and cancellation per job. See the README's "Running in pods". */
+export interface Pool {
+  convertFile(input: string, outDir: string, options?: ConvertOptions & JobOptions): Promise<StreamResult>;
+  inspectFile(input: string, options?: JobOptions): Promise<Inspection>;
+  assembleFiles(inputs: string[], outPath: string, options?: JobOptions): Promise<number>;
+  /** Spawns all workers now. */
+  warmUp(): void;
+  stats(): PoolStats;
+  close(): Promise<void>;
+}
+
+/** Node only. Jobs beyond `size` wait in a queue; the process never holds more than `size` conversions in memory. */
+export function createPool(options?: PoolOptions): Pool;
+
+/** Node only: one conversion in its own worker thread, whose memory is released when it ends. */
+export function convertFileInWorker(input: string, outDir: string, options?: ConvertOptions & JobOptions): Promise<StreamResult>;
 
 /**
  * Bounded-memory merge: `next()` returns the next PDF or null when done;

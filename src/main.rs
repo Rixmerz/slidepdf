@@ -9,6 +9,11 @@ use std::process::ExitCode;
 
 use slidepdf::{fragments, Options, Preset};
 
+/// Counting allocator, so `--memory-limit` can cut a conversion off and
+/// the summary can show the peak.
+#[global_allocator]
+static ALLOC: slidepdf::budget::Budget = slidepdf::budget::Budget;
+
 const VIEWER_JS: &str = include_str!("../viewer/slide-viewer.js");
 const VIEWER_HTML: &str = include_str!("../viewer/index.html");
 
@@ -20,6 +25,7 @@ USAGE:
   slidepdf fragments <deck.pptx|doc.pdf> -o <dir> [options]
   slidepdf assemble  <dir|a.pdf b.pdf ...> -o out.pdf [--range 2-5,8]
   slidepdf report    <deck.pptx> [--json]
+  slidepdf inspect   <deck.pptx> [--json]
   slidepdf search    <dir> <words...>
 
 OPTIONS:
@@ -29,7 +35,12 @@ OPTIONS:
   --no-viewer                     fragments: do not write index.html / slide-viewer.js
   --no-pdf                        fragments: do not write the full deck.pdf
   --cache-mb <n>                  memory for reusing prepared images (default 16)
+  --memory-limit <mb>             abort if heap use exceeds this (exit code 134)
+  --timeout <seconds>             abort if the command runs longer (exit code 124)
+  --quiet                         no summary on stderr (errors and warnings only)
 
+`inspect` sizes up a deck in milliseconds (slides, media bytes) without
+converting it, to decide which queue it goes to.
 `fragments` writes slide-NNN.pdf (one standalone PDF per slide), manifest.json
 (order, hashes, titles, text index), report.json, deck.pdf and a static viewer.
 `assemble` rebuilds one PDF from stored fragments, checking their hashes
@@ -43,6 +54,9 @@ struct Args {
     range: Option<String>,
     json: bool,
     viewer: bool,
+    quiet: bool,
+    memory_limit: usize,
+    timeout: Option<u64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -59,6 +73,9 @@ fn parse_args() -> Result<Args, String> {
         range: None,
         json: false,
         viewer: true,
+        quiet: false,
+        memory_limit: 0,
+        timeout: None,
     };
     let mut fonts = Vec::new();
     while let Some(arg) = it.next() {
@@ -80,6 +97,20 @@ fn parse_args() -> Result<Args, String> {
             "--no-viewer" => a.viewer = false,
             "--no-pdf" => a.opts.full_pdf = false,
             "--cache-mb" => a.opts.cache_bytes = val("--cache-mb")?.parse::<usize>().map_err(|_| "--cache-mb needs a number")? << 20,
+            "--memory-limit" => {
+                a.memory_limit = val("--memory-limit")?
+                    .parse::<usize>()
+                    .map_err(|_| "--memory-limit needs a number of MB")?
+                    << 20
+            }
+            "--timeout" => {
+                a.timeout = Some(
+                    val("--timeout")?
+                        .parse::<u64>()
+                        .map_err(|_| "--timeout needs a number of seconds")?,
+                )
+            }
+            "--quiet" | "-q" => a.quiet = true,
             s if s.starts_with('-') => return Err(format!("unknown option {s}\n\n{USAGE}")),
             _ => a.inputs.push(arg),
         }
@@ -113,6 +144,27 @@ fn kb(n: usize) -> String {
     format!("{:.1} KB", n as f64 / 1024.0)
 }
 
+fn peak_mb() -> String {
+    format!("peak memory {:.1} MB", slidepdf::budget::peak() as f64 / 1048576.0)
+}
+
+/// Arms the limits from `--memory-limit` and `--timeout`. The timeout is a
+/// watchdog thread: the converter is single-threaded and synchronous, so
+/// exiting the process is the only way to cut it off.
+fn arm_limits(a: &Args) {
+    slidepdf::budget::reset_peak();
+    if a.memory_limit > 0 {
+        slidepdf::budget::set_limit(a.memory_limit);
+    }
+    if let Some(secs) = a.timeout {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            eprintln!("slidepdf: timeout of {secs} s exceeded");
+            std::process::exit(124);
+        });
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -126,6 +178,8 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let mut a = parse_args()?;
     let first = a.inputs.first().cloned().ok_or_else(|| format!("missing input\n\n{USAGE}"))?;
+    arm_limits(&a);
+    let quiet = a.quiet;
     match a.cmd.as_str() {
         "convert" => {
             a.opts.fragments = false;
@@ -135,13 +189,16 @@ fn run() -> Result<(), String> {
             let mut out = create(&dest)?;
             let summary = slidepdf::convert_stream(input, &a.opts, Some(&mut out), &mut |_| Ok(())).map_err(|e| e.0)?;
             out.flush().map_err(|e| format!("{}: {e}", dest.display()))?;
-            eprintln!(
-                "{} -> {} ({}, {} slides)",
-                first,
-                dest.display(),
-                kb(summary.manifest.pdf_bytes.unwrap_or(0)),
-                summary.report.slides
-            );
+            if !quiet {
+                eprintln!(
+                    "{} -> {} ({}, {} slides, {})",
+                    first,
+                    dest.display(),
+                    kb(summary.manifest.pdf_bytes.unwrap_or(0)),
+                    summary.report.slides,
+                    peak_mb()
+                );
+            }
             if !summary.report.is_clean() {
                 eprint!("{}", summary.report.to_text());
             }
@@ -176,7 +233,9 @@ fn run() -> Result<(), String> {
                 if let Some(mut f) = full {
                     f.flush().map_err(|e| e.to_string())?;
                 }
-                eprint!("{}", summary.report.to_text());
+                if !quiet || !summary.report.is_clean() {
+                    eprint!("{}", summary.report.to_text());
+                }
                 (summary.manifest, summary.report.to_json())
             };
             write(&dir.join("manifest.json"), manifest.to_json().as_bytes())?;
@@ -186,16 +245,46 @@ fn run() -> Result<(), String> {
                 write(&dir.join("index.html"), VIEWER_HTML.as_bytes())?;
             }
             let total: usize = manifest.fragments.iter().map(|f| f.bytes).sum();
-            eprintln!(
-                "{} fragments ({} total, {} largest) in {}{}",
-                manifest.fragments.len(),
-                kb(total),
-                kb(manifest.fragments.iter().map(|f| f.bytes).max().unwrap_or(0)),
-                dir.display(),
-                manifest.pdf_bytes.map(|b| format!(", deck.pdf {}", kb(b))).unwrap_or_default()
-            );
+            if !quiet {
+                eprintln!(
+                    "{} fragments ({} total, {} largest) in {}{}, {}",
+                    manifest.fragments.len(),
+                    kb(total),
+                    kb(manifest.fragments.iter().map(|f| f.bytes).max().unwrap_or(0)),
+                    dir.display(),
+                    manifest.pdf_bytes.map(|b| format!(", deck.pdf {}", kb(b))).unwrap_or_default(),
+                    peak_mb()
+                );
+            }
         }
         "assemble" => assemble(&a)?,
+        "inspect" => {
+            let i = slidepdf::inspect(open(&first)?).map_err(|e| e.0)?;
+            if a.json {
+                println!(
+                    "{{\"slides\":{},\"width\":{},\"height\":{},\"parts\":{},\"bytes\":{},\"media\":{},\"mediaBytes\":{},\"largestMediaBytes\":{},\"largestMedia\":{:?},\"embeddedFonts\":{}}}",
+                    i.slides, i.width, i.height, i.parts, i.bytes, i.media, i.media_bytes, i.largest_media_bytes, i.largest_media, i.embedded_fonts
+                );
+            } else {
+                println!(
+                    "{first}: {} slides, {:.0}x{:.0} pt, {} parts ({:.1} MB), {} media parts ({:.1} MB, largest {:.1} MB {}){}",
+                    i.slides,
+                    i.width,
+                    i.height,
+                    i.parts,
+                    i.bytes as f64 / 1048576.0,
+                    i.media,
+                    i.media_bytes as f64 / 1048576.0,
+                    i.largest_media_bytes as f64 / 1048576.0,
+                    i.largest_media,
+                    if i.embedded_fonts > 0 {
+                        format!(", {} embedded fonts", i.embedded_fonts)
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
         "report" => {
             let mut o = a.opts.clone();
             o.fragments = false;

@@ -760,6 +760,68 @@ pub fn parse(bytes: &[u8], opts: &ParseOptions) -> Result<Deck, String> {
     parse_package(&mut Package::from_bytes(bytes)?, opts)
 }
 
+/// What a cheap look at a package tells about the work ahead. See [`inspect`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Inspection {
+    /// Slides listed by the presentation, hidden ones included.
+    pub slides: usize,
+    /// Page size in PDF points.
+    pub width: f32,
+    pub height: f32,
+    /// Entries in the package.
+    pub parts: usize,
+    /// Uncompressed size of every part, as declared.
+    pub bytes: u64,
+    /// Pictures, videos and other media parts, and their declared bytes.
+    pub media: usize,
+    pub media_bytes: u64,
+    /// The biggest media part: the one that drives peak memory.
+    pub largest_media_bytes: u64,
+    pub largest_media: String,
+    /// Embedded font parts (ppt/fonts/*), which the converter ignores.
+    pub embedded_fonts: usize,
+}
+
+/// Sizes up a package without converting it: only the zip directory and
+/// presentation.xml are read, so it costs a few milliseconds whatever the
+/// deck. Use it to route big decks to a bigger queue, or to refuse them,
+/// before spending a conversion slot.
+pub fn inspect<R: Read + Seek>(pkg: &mut Package<R>) -> Result<Inspection, String> {
+    let mut i = Inspection {
+        parts: pkg.zip.len(),
+        ..Default::default()
+    };
+    for idx in 0..pkg.zip.len() {
+        let Ok(f) = pkg.zip.by_index_raw(idx) else { continue };
+        let size = f.size();
+        i.bytes += size;
+        let name = f.name();
+        if name.starts_with("ppt/media/") {
+            i.media += 1;
+            i.media_bytes += size;
+            if size > i.largest_media_bytes {
+                i.largest_media_bytes = size;
+                i.largest_media = name.to_string();
+            }
+        } else if name.starts_with("ppt/fonts/") {
+            i.embedded_fonts += 1;
+        }
+    }
+    let root_rels = pkg.rels("");
+    let pres_path = rel_of(&root_rels, "officeDocument")
+        .map(|r| r.target.clone())
+        .unwrap_or_else(|| "ppt/presentation.xml".into());
+    let pres = pkg.xml(&pres_path).ok_or("missing presentation.xml")?;
+    let (w, h) = pres
+        .child("sldSz")
+        .map(|s| (s.attr_i64("cx").unwrap_or(9144000), s.attr_i64("cy").unwrap_or(6858000)))
+        .unwrap_or((9144000, 6858000));
+    i.width = w as f32 / crate::ir::EMU_PER_PT;
+    i.height = h as f32 / crate::ir::EMU_PER_PT;
+    i.slides = pres.child("sldIdLst").map(|l| l.children_named("sldId").count()).unwrap_or(0);
+    Ok(i)
+}
+
 /// Parses the deck structure. Image bytes are not loaded: `Deck::media`
 /// lists their paths, read later with [`Package::read_media`].
 pub fn parse_package<R: Read + Seek>(pkg: &mut Package<R>, opts: &ParseOptions) -> Result<Deck, String> {

@@ -1,11 +1,49 @@
 // Node.js API over a loaded wasm-bindgen module (shared by full and lite).
 import { createRequire } from "node:module";
-import { wrap, search } from "./common.js";
+import { wrap, search, SlidepdfError } from "./common.js";
 
 const require = createRequire(import.meta.url);
 
-export function makeNodeApi(raw) {
-  const api = wrap(raw);
+/**
+ * Builds the Node API for the glue at `glue` (a path relative to this
+ * file). The module is loaded lazily and reloaded after a trap (a memory
+ * limit hit), so one failed conversion does not poison the process.
+ */
+export function makeNodeApi(glue) {
+  let get, reload;
+  if (typeof glue === "string") {
+    const resolved = require.resolve(glue);
+    let raw = null;
+    get = () => raw ?? (raw = require(resolved));
+    reload = () => {
+      delete require.cache[resolved];
+      raw = null;
+    };
+  } else {
+    // An already initialised module (a worker given a shared compiled
+    // module); `reload` is whatever the owner can do after a trap.
+    ({ get, reload } = glue);
+  }
+  const api = wrap(get, reload);
+
+  function openSource(input) {
+    const fs = require("node:fs");
+    const fd = fs.openSync(input, "r");
+    const size = fs.fstatSync(fd).size;
+    // One reusable buffer: the WebAssembly side copies each chunk out
+    // immediately, so allocating per read would only feed the GC.
+    let scratch = Buffer.allocUnsafe(1 << 16);
+    return {
+      fd,
+      size,
+      read(offset, length) {
+        if (length > scratch.length) scratch = Buffer.allocUnsafe(length);
+        const n = fs.readSync(fd, scratch, 0, length, offset);
+        return scratch.subarray(0, n);
+      },
+      close: () => fs.closeSync(fd),
+    };
+  }
 
   /**
    * Converts a PPTX file into `outDir` with bounded memory: the package is
@@ -16,24 +54,15 @@ export function makeNodeApi(raw) {
     const fs = require("node:fs");
     const path = require("node:path");
     fs.mkdirSync(outDir, { recursive: true });
-    const fd = fs.openSync(input, "r");
-    const size = fs.fstatSync(fd).size;
-    const pdfFd = options.fullPdf === false ? null : fs.openSync(path.join(outDir, "deck.pdf"), "w");
+    const { onProgress, shouldCancel, ...opts } = options;
+    const source = openSource(input);
+    const pdfFd = opts.fullPdf === false ? null : fs.openSync(path.join(outDir, "deck.pdf"), "w");
     try {
-      // One reusable buffer: the WebAssembly side copies each chunk out
-      // immediately, so allocating per read would only feed the GC.
-      let scratch = Buffer.allocUnsafe(1 << 16);
-      const source = {
-        size,
-        read(offset, length) {
-          if (length > scratch.length) scratch = Buffer.allocUnsafe(length);
-          const n = fs.readSync(fd, scratch, 0, length, offset);
-          return scratch.subarray(0, n);
-        },
-      };
-      const out = api.convertStream(source, { sourceName: path.basename(input), ...options }, {
+      const out = api.convertStream(source, { sourceName: path.basename(input), ...opts }, {
         onFragment: (f) => fs.writeFileSync(path.join(outDir, f.file), f.pdf),
         onPdf: pdfFd === null ? undefined : (chunk) => fs.writeSync(pdfFd, chunk),
+        onProgress,
+        shouldCancel,
         // Both callbacks write synchronously, so views into wasm memory are safe.
         zeroCopy: true,
       });
@@ -41,8 +70,18 @@ export function makeNodeApi(raw) {
       fs.writeFileSync(path.join(outDir, "report.json"), JSON.stringify(out.report));
       return out;
     } finally {
-      fs.closeSync(fd);
+      source.close();
       if (pdfFd !== null) fs.closeSync(pdfFd);
+    }
+  }
+
+  /** Sizes up a .pptx file in milliseconds without converting it. */
+  function inspectFile(input) {
+    const source = openSource(input);
+    try {
+      return api.inspect(source);
+    } finally {
+      source.close();
     }
   }
 
@@ -65,7 +104,5 @@ export function makeNodeApi(raw) {
     }
   }
 
-  return { ...api, convertFile, assembleFiles, search, ready: async () => {} };
+  return { ...api, convertFile, inspectFile, assembleFiles, search, SlidepdfError, ready: async () => {} };
 }
-
-export const loadRaw = (path) => require(path);

@@ -6,6 +6,65 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use js_sys::{Array, Function, Object, Reflect, Uint8Array};
 use wasm_bindgen::prelude::*;
 
+/// Counting allocator: `setMemoryLimit` caps a conversion and `memoryStats`
+/// reports its peak. WebAssembly memory never shrinks, so the peak is also
+/// what the instance keeps.
+#[global_allocator]
+static ALLOC: slidepdf::budget::Budget = slidepdf::budget::Budget;
+
+/// Caps heap use at `mb` megabytes (0 removes the cap). When a conversion
+/// exceeds it, the instance traps (a `WebAssembly.RuntimeError` in JS) and
+/// must not be used again; `memoryLimitHit()` then returns true.
+#[wasm_bindgen(js_name = setMemoryLimit)]
+pub fn set_memory_limit(mb: f64) {
+    slidepdf::budget::set_limit((mb.max(0.0) as usize) << 20);
+}
+
+/// `{ inUse, peak, limit, linear }` in bytes. `peak` restarts at every
+/// conversion; `linear` is the size of WebAssembly memory, which only grows.
+#[wasm_bindgen(js_name = memoryStats)]
+pub fn memory_stats() -> JsValue {
+    let o = Object::new();
+    set(&o, "inUse", slidepdf::budget::in_use() as f64);
+    set(&o, "peak", slidepdf::budget::peak() as f64);
+    set(&o, "limit", slidepdf::budget::limit() as f64);
+    set(&o, "linear", (core::arch::wasm32::memory_size(0) * 65536) as f64);
+    o.into()
+}
+
+/// Whether the last trap was the memory limit (as opposed to a bug).
+#[wasm_bindgen(js_name = memoryLimitHit)]
+pub fn memory_limit_hit() -> bool {
+    slidepdf::budget::limit_hit()
+}
+
+/// Sizes up a package without converting it (see `Inspection` in the
+/// typings). `read(offset, length)` supplies the bytes, as in `convertStreamRaw`.
+#[wasm_bindgen(js_name = inspectRaw)]
+pub fn inspect_raw(size: f64, read: Function) -> Result<JsValue, JsError> {
+    let input = std::io::BufReader::with_capacity(
+        64 << 10,
+        JsReader {
+            read,
+            size: size as u64,
+            pos: 0,
+        },
+    );
+    let i = slidepdf::inspect(input).map_err(|e| JsError::new(&e.0))?;
+    let o = Object::new();
+    set(&o, "slides", i.slides as u32);
+    set(&o, "width", i.width);
+    set(&o, "height", i.height);
+    set(&o, "parts", i.parts as u32);
+    set(&o, "bytes", i.bytes as f64);
+    set(&o, "media", i.media as u32);
+    set(&o, "mediaBytes", i.media_bytes as f64);
+    set(&o, "largestMediaBytes", i.largest_media_bytes as f64);
+    set(&o, "largestMedia", i.largest_media.as_str());
+    set(&o, "embeddedFonts", i.embedded_fonts as u32);
+    Ok(o.into())
+}
+
 fn set(o: &Object, k: &str, v: impl Into<JsValue>) {
     let _ = Reflect::set(o, &JsValue::from_str(k), &v.into());
 }
@@ -58,6 +117,7 @@ fn options(js: &JsValue) -> Result<slidepdf::Options, JsError> {
 /// Returns `{ pdf, fragments, manifestJson, reportJson, reportText }`.
 #[wasm_bindgen(js_name = convertRaw)]
 pub fn convert_raw(pptx: &[u8], opts: JsValue) -> Result<JsValue, JsError> {
+    slidepdf::budget::reset_peak();
     let o = options(&opts)?;
     let out = slidepdf::convert(pptx, &o).map_err(|e| JsError::new(&e.0))?;
     let res = Object::new();
@@ -160,10 +220,12 @@ fn fragment_js(f: &slidepdf::Fragment, zero_copy: bool) -> Object {
 /// supplies the PPTX, `onFragment(fragment)` receives each slide PDF as
 /// soon as it is ready, `onPdf(chunk)` (optional) receives the full PDF
 /// in pieces. Returns `{ manifestJson, reportJson, reportText }`.
-#[wasm_bindgen(js_name = convertStreamRaw)]
+///
 /// With `zero_copy`, the `pdf` bytes handed to the callbacks are views into
 /// WebAssembly memory, valid only until the callback returns (write them
-/// out synchronously, or copy them).
+/// out synchronously, or copy them). `onProgress(done, total)` (optional)
+/// runs after every slide; returning `false` cancels the conversion.
+#[wasm_bindgen(js_name = convertStreamRaw)]
 pub fn convert_stream_raw(
     size: f64,
     read: Function,
@@ -171,7 +233,9 @@ pub fn convert_stream_raw(
     on_fragment: Function,
     on_pdf: Option<Function>,
     zero_copy: bool,
+    on_progress: Option<Function>,
 ) -> Result<JsValue, JsError> {
+    slidepdf::budget::reset_peak();
     let mut o = options(&opts)?;
     o.full_pdf = on_pdf.is_some() && o.full_pdf;
     let input = std::io::BufReader::with_capacity(
@@ -185,12 +249,28 @@ pub fn convert_stream_raw(
     let mut sink = on_pdf.map(|f| std::io::BufWriter::with_capacity(256 << 10, JsWriter(f, zero_copy)));
     let summary = {
         let full: Option<&mut dyn Write> = sink.as_mut().map(|w| w as &mut dyn Write);
-        slidepdf::convert_stream(input, &o, full, &mut |f| {
-            on_fragment
-                .call1(&JsValue::NULL, &fragment_js(&f, zero_copy))
-                .map(|_| ())
-                .map_err(|e| format!("onFragment failed: {e:?}"))
-        })
+        slidepdf::convert_stream_with(
+            input,
+            &o,
+            full,
+            &mut |f| {
+                on_fragment
+                    .call1(&JsValue::NULL, &fragment_js(&f, zero_copy))
+                    .map(|_| ())
+                    .map_err(|e| format!("onFragment failed: {e:?}"))
+            },
+            &mut |p| match &on_progress {
+                Some(cb) => cb
+                    .call2(
+                        &JsValue::NULL,
+                        &JsValue::from_f64(p.done as f64),
+                        &JsValue::from_f64(p.total as f64),
+                    )
+                    .map(|v| v.as_bool().unwrap_or(true))
+                    .unwrap_or(false),
+                None => true,
+            },
+        )
         .map_err(|e| JsError::new(&e.0))?
     };
     if let Some(mut w) = sink {
@@ -219,6 +299,7 @@ pub fn assemble(parts: Array) -> Result<Uint8Array, JsError> {
 #[cfg(feature = "assemble")]
 #[wasm_bindgen(js_name = assembleStreamRaw)]
 pub fn assemble_stream_raw(next: Function, on_pdf: Function, zero_copy: bool) -> Result<u32, JsError> {
+    slidepdf::budget::reset_peak();
     let parts = std::iter::from_fn(|| match next.call0(&JsValue::NULL) {
         Ok(v) if v.is_null() || v.is_undefined() => None,
         Ok(v) => Some(Ok(Uint8Array::new(&v).to_vec())),

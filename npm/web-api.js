@@ -1,5 +1,5 @@
 // Browser / Workers / Deno API over a wasm-bindgen "web" module.
-import { wrap, search } from "./common.js";
+import { wrap, search, SlidepdfError } from "./common.js";
 
 export function makeWebApi(init, raw, defaultWasmUrl) {
   let api = null;
@@ -16,6 +16,13 @@ export function makeWebApi(init, raw, defaultWasmUrl) {
     },
     convert: (pptx, options) => need().convert(pptx, options),
     convertStream: (source, options, callbacks) => need().convertStream(source, options, callbacks),
+    inspect: (pptx) => need().inspect(pptx),
+    // After a memory-limit trap the instance is dead and ready() cannot
+    // rebuild it: in browsers and Workers, set a limit only where the
+    // isolate can be thrown away (a Worker per job, a reloaded page).
+    setMemoryLimit: (mb) => need().setMemoryLimit(mb),
+    memoryStats: () => need().memoryStats(),
+    SlidepdfError,
     assemble: (parts) => need().assemble(parts),
     assembleStream: (next, onPdf, opts) => need().assembleStream(next, onPdf, opts),
     split: (pdf) => need().split(pdf),

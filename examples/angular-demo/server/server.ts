@@ -16,12 +16,24 @@ import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { join, normalize } from "node:path";
 import { randomUUID } from "node:crypto";
-import { convertFile, assembleFiles, verifyFragment, type Preset, type Manifest } from "slidepdf";
+import { createPool, verifyFragment, SlidepdfError, type Preset, type Manifest } from "slidepdf";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const STORE = join(import.meta.dirname, "..", "store");
 const MAX_UPLOAD_MB = Number(process.env.MAX_UPLOAD_MB ?? 500);
 const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
+// Decks with more slides than this are refused up front, before taking a worker.
+const MAX_SLIDES = Number(process.env.MAX_SLIDES ?? 500);
+
+// Conversions run in worker threads with a hard budget each, so a bad deck
+// fails on its own and the process memory stays at roughly
+// size x (memoryMb + 30 MB) whatever comes in. See "Running in pods" in the README.
+const pool = createPool({
+  size: Number(process.env.WORKERS ?? 2),
+  memoryMb: Number(process.env.MEMORY_MB ?? 256),
+  timeoutMs: Number(process.env.TIMEOUT_MS ?? 120_000),
+  recycleAboveMb: 64,
+});
 
 /** Streams the upload to disk so a large deck never sits in memory. */
 async function saveUpload(req: IncomingMessage, dest: string): Promise<number> {
@@ -42,6 +54,13 @@ class HttpError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+/** A client that goes away cancels its conversion after the current slide. */
+function abortOnClose(req: IncomingMessage): AbortSignal {
+  const ac = new AbortController();
+  req.once("close", () => ac.abort());
+  return ac.signal;
 }
 
 function json(res: ServerResponse, status: number, data: unknown) {
@@ -79,18 +98,24 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     await mkdir(dir, { recursive: true });
     const upload = join(dir, "source.pptx");
     const pptxBytes = await saveUpload(req, upload);
-    const started = performance.now();
     let out;
     try {
+      // Preflight in milliseconds: refuse oversized decks before converting.
+      const info = await pool.inspectFile(upload);
+      if (info.slides > MAX_SLIDES) throw new HttpError(413, `deck has ${info.slides} slides, more than the ${MAX_SLIDES} allowed`);
       // Bounded memory: reads the deck from disk and writes each output as it is produced.
-      out = convertFile(upload, dir, { preset, sourceName: name });
+      out = await pool.convertFile(upload, dir, { preset, sourceName: name, signal: AbortSignal.any([abortOnClose(req)]) });
     } catch (e) {
       await rm(dir, { recursive: true, force: true });
-      throw new HttpError(422, `could not convert: ${(e as Error).message}`);
+      if (e instanceof HttpError) throw e;
+      const err = e as SlidepdfError;
+      // Each failure code maps to a status the client can act on.
+      const status = { memory: 413, timeout: 408, aborted: 499, convert: 422 }[err.code] ?? 500;
+      throw new HttpError(status, `could not convert (${err.code}): ${err.message}`);
     } finally {
       await rm(upload, { force: true });
     }
-    const ms = Math.round(performance.now() - started);
+    const ms = Math.round(out.stats.ms);
     const fragmentBytes = out.manifest.slides.reduce((s, f) => s + f.bytes, 0);
     const pdfBytes = (await stat(join(dir, "deck.pdf"))).size;
     return json(res, 200, {
@@ -118,7 +143,7 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
     }
     const out = join(tmpdir(), `slidepdf-${randomUUID()}.pdf`);
     try {
-      assembleFiles(files, out);
+      await pool.assembleFiles(files, out);
       const { size } = await stat(out);
       res.writeHead(200, {
         "content-type": "application/pdf",

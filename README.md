@@ -105,11 +105,83 @@ suites): no crashes or hangs; the 11 rejected files are corrupt archives.
 About 2,900 mutated variants of feature-rich decks (byte flips inside XML and
 media, hostile numbers, truncations) in release and debug builds: no crashes.
 
-In Node, the WebAssembly build peaks around 140 MB on the 123 MB deck with
-`convertFile` (about 50 MB of it is Node itself and 25 MB the compiled module).
-For memory-constrained pods, run the native binary as a job; in Node, use
-`convertFile` / `convertStream` rather than `convert`, which keeps every
-output in memory.
+In Node, use `convertFile` / `convertStream` rather than `convert`, which
+keeps every output in memory; and for anything that serves more than one
+deck, the worker pool below.
+
+## Running in pods
+
+Four things make a converter predictable inside a memory-limited container,
+and all four are built in:
+
+1. **A hard memory cap per conversion.** The library counts every heap
+   allocation (`slidepdf::budget`). Past the cap, the conversion fails on
+   its own instead of growing until the orchestrator kills the pod:
+   `--memory-limit <mb>` in the CLI (exit code 134 and a message on stderr),
+   `memoryMb` in the Node pool, `setMemoryLimit(mb)` on the direct API.
+2. **A timeout.** `--timeout <seconds>` in the CLI (exit code 124);
+   `timeoutMs` in Node, which is cooperative: the converter checks the clock
+   after every slide and stops with code `timeout`, so the worker survives
+   and the overrun is at most one slide. The pool kills a worker that does
+   not stop within `killGraceMs` (default 5 s). `signal` (an `AbortSignal`)
+   cancels the same way.
+3. **Isolation.** In Node, `createPool({ size })` runs conversions in
+   worker threads, at most `size` at a time (the rest queue). WebAssembly
+   memory never shrinks, so a worker that grew past `recycleAboveMb`
+   (default 64) is replaced; a replacement costs about 15 ms. Process memory
+   is then bounded by roughly `size x (memoryMb + 30 MB) + 70 MB`.
+4. **A preflight.** `inspect` / `inspectFile` / `slidepdf inspect` read only
+   the zip directory and `presentation.xml` (12 MB and a few milliseconds
+   on the 123 MB deck) and return slide count, page size and media bytes, so
+   a server can refuse or re-route a deck before taking a conversion slot.
+
+```ts
+import { createPool } from "slidepdf";
+
+const pool = createPool({ size: 2, memoryMb: 256, timeoutMs: 120_000 });
+
+const info = await pool.inspectFile(upload);       // { slides, mediaBytes, largestMediaBytes, ... }
+if (info.slides > 500) throw new Error("too many slides");
+
+try {
+  const { manifest, stats } = await pool.convertFile(upload, outDir, {
+    preset: "balanced",
+    signal: request.signal,
+    onProgress: (done, total) => console.log(`${done}/${total}`),
+  });
+  console.log(stats);                                // { ms, peakBytes, slides, inputBytes }
+} catch (e) {
+  switch (e.code) {                                  // SlidepdfError
+    case "memory":  /* 413: the deck needs more than memoryMb */ break;
+    case "timeout": /* 408 */ break;
+    case "aborted": /* client went away */ break;
+    case "convert": /* 422: not a PPTX, corrupt, over the hard limits */ break;
+  }
+}
+```
+
+Timing stays flat across workers: the pool compiles the module once, eagerly
+(`eagerCompile`, a process-wide V8 flag that costs about 13 MB), and hands
+the same compiled module to every worker, so a fresh worker runs as fast as
+a warm one. Create the pool before calling the direct API (`convertFile`,
+`inspectFile`) in the same process, otherwise V8 reuses the lazily compiled
+module and the first conversion in each worker is slower. Measured on the 123 MB deck with `balanced`, three fresh workers
+in a row: 4.9 s, 4.8 s, 4.7 s (6.7 s cold and 4.7 s warm without it), peak
+heap 19 MB each, process RSS back to 144 MB after each worker is retired.
+
+The native CLI is the lightest option for a job runner: 27 MB RSS on the
+123 MB deck, and `Dockerfile` builds a scratch image of 4.3 MB (the image
+runs as an unprivileged user; pass `--user` to write into a directory you own):
+
+```sh
+docker build -t slidepdf .
+docker run --rm -m 64m --user "$(id -u):$(id -g)" -v "$PWD:/work" slidepdf \
+  fragments /work/deck.pptx -o /work/out --memory-limit 32 --timeout 60 --quiet
+```
+
+Every failure has a stable code (`SlidepdfError.code` in npm, the exit code in
+the CLI): `convert`, `memory`, `timeout`, `aborted`, `cancelled`, `trap`,
+`worker`, `closed`.
 
 ## npm (WebAssembly)
 
@@ -122,8 +194,11 @@ import { convertFile } from "slidepdf";
 
 // Node, bounded memory: reads from disk, writes slide-NNN.pdf, deck.pdf,
 // manifest.json and report.json into the directory as they are produced.
-const { manifest, report } = convertFile("course.pptx", "out/course-1", { preset: "balanced" });
+const { manifest, report, stats } = convertFile("course.pptx", "out/course-1", { preset: "balanced" });
 ```
+
+Servers should use `createPool` instead (worker threads with a memory cap,
+timeout and cancellation per job): see "Running in pods" above.
 
 ```ts
 import { convert, convertStream, assemble, search, ready } from "slidepdf";
@@ -190,7 +265,9 @@ See `examples/angular-demo` for an Angular 22 + Node integration.
 
 ## Production notes
 
-- Convert at upload time, in a job or worker, not on request.
+- Convert at upload time, in a job or worker, not on request; in Node use
+  `createPool` with `memoryMb` and `timeoutMs` set, and `inspectFile` to
+  refuse oversized decks first.
 - Store `slide-NNN.pdf`, `deck.pdf` and `manifest.json` on the CDN with
   long-lived caching; fragments are immutable and the manifest carries their
   hashes.

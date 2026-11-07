@@ -1,6 +1,6 @@
 {
   "name": "slidepdf",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Ultra-light PPTX to PDF converter (WebAssembly) with per-slide PDF fragments, reassembly and a <slide-viewer> web component",
   "license": "MIT OR Apache-2.0",
   "type": "module",
@@ -22,6 +22,8 @@
   "files": [
     "node.js",
     "node-api.js",
+    "pool.js",
+    "worker-thread.js",
     "web.js",
     "web-api.js",
     "common.js",
@@ -44,7 +46,7 @@
     "viewer"
   ],
   "scripts": {
-    "test": "node --test test/convert.test.js"
+    "test": "node --test test/"
   },
   "repository": {
     "type": "git",
