@@ -785,6 +785,7 @@ pub fn parse_package<R: Read + Seek>(pkg: &mut Package<R>, opts: &ParseOptions) 
         height,
         slides: Vec::new(),
         media: BTreeSet::new(),
+        embedded: std::collections::BTreeMap::new(),
         warnings: Vec::new(),
     };
     let mut masters: HashMap<String, MasterCtx> = HashMap::new();
@@ -883,6 +884,7 @@ pub fn parse_package<R: Read + Seek>(pkg: &mut Package<R>, opts: &ParseOptions) 
             pkg: &mut *pkg,
             _z: std::marker::PhantomData,
             deck_media: &mut deck.media,
+            embedded: &mut deck.embedded,
             warnings: &mut deck.warnings,
             number,
             theme,
@@ -956,6 +958,8 @@ struct SlideBuilder<'p, 'z, 'c, R> {
     pkg: &'p mut Package<R>,
     _z: std::marker::PhantomData<&'z ()>,
     deck_media: &'p mut BTreeSet<String>,
+    /// PNGs extracted from metafiles (see `Deck::embedded`).
+    embedded: &'p mut std::collections::BTreeMap<String, Vec<u8>>,
     warnings: &'p mut Vec<Warning>,
     number: usize,
     theme: &'c Theme,
@@ -1209,6 +1213,9 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         let Some(rid) = n.path(&["blipFill", "blip"]).and_then(|b| b.attr("embed")) else {
             return;
         };
+        if self.metafile(part, rid, xf.rect(x.rect)) {
+            return;
+        }
         let Some(media) = self.media(part, rid) else { return };
         let crop = n
             .path(&["blipFill", "srcRect"])
@@ -1856,6 +1863,9 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             let rid = pic.and_then(|p| p.path(&["blipFill", "blip"])).and_then(|b| b.attr("embed"));
             match (rid, n.child("xfrm").and_then(parse_xfrm)) {
                 (Some(rid), Some(x)) => {
+                    if self.metafile(part, rid, xf.rect(x.rect)) {
+                        return;
+                    }
                     if let Some(media) = self.media(part, rid) {
                         self.elements.push(Element::Picture(Picture {
                             rect: xf.rect(x.rect),
@@ -1882,6 +1892,54 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         } else {
             self.warn(format!("graphic frame '{uri}' skipped"));
         }
+    }
+
+    /// EMF/WMF pictures are replayed into vector shapes. Returns true when
+    /// `rid` is a metafile (drawn, or skipped with a warning).
+    fn metafile(&mut self, part: &Part, rid: &str, rect: Rect) -> bool {
+        let Some(target) = part.rels.get(rid).map(|r| r.target.clone()) else {
+            return false;
+        };
+        let lower = target.to_ascii_lowercase();
+        if !(lower.ends_with(".emf") || lower.ends_with(".wmf")) {
+            return false;
+        }
+        let Some(bytes) = self.pkg.read_media(&target) else {
+            self.warn(format!("{target}: missing or too large, skipped"));
+            return true;
+        };
+        match crate::metafile::render(&bytes, rect) {
+            Ok((elements, bitmaps)) => {
+                if elements.is_empty() {
+                    self.warn(format!(
+                        "{target}: metafile has no drawable content we support (EMF+ only?), skipped"
+                    ));
+                    return true;
+                }
+                // Bitmaps live in memory until rendering; keep them bounded.
+                let mut used: usize = self.embedded.values().map(|v| v.len()).sum();
+                for (i, png) in bitmaps.into_iter().enumerate() {
+                    if used + png.len() > 64 << 20 {
+                        self.warn(format!("{target}: too many embedded bitmaps, some were skipped"));
+                        break;
+                    }
+                    used += png.len();
+                    self.embedded.insert(format!("{target}#bitmap{i}"), png);
+                }
+                for mut e in elements {
+                    if let Element::Picture(p) = &mut e {
+                        p.media = format!("{target}{}", p.media);
+                        if !self.embedded.contains_key(&p.media) {
+                            continue;
+                        }
+                        self.deck_media.insert(p.media.clone());
+                    }
+                    self.elements.push(e);
+                }
+            }
+            Err(e) => self.warn(format!("{target}: {e}, skipped")),
+        }
+        true
     }
 
     /// Charts are redrawn from the values cached in the chart part.

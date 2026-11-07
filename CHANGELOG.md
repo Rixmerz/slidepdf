@@ -17,6 +17,12 @@ All notable changes to this project are documented here. The format follows
   like Office, and the chart's own background (color, picture or texture).
   3D charts are drawn flat and reported. In the 539-deck test corpus no chart
   is skipped any more (25 before).
+- EMF and WMF pictures (logos, clip art, previews of embedded Excel/Word
+  objects) are replayed into vector shapes, text and embedded bitmaps:
+  pens, brushes, fonts, window/viewport mapping, world transforms, paths,
+  polygons, Béziers, rectangles, ellipses, pattern fills and DIBs. Clipping
+  regions and non-copy raster operations are not supported. In the corpus no
+  metafile is skipped any more (25 before).
 
 ## [0.1.0] - 2026-11-06
 

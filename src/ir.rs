@@ -37,6 +37,9 @@ pub struct Deck {
     /// Package paths of the images used (e.g. `ppt/media/image1.jpg`).
     /// The bytes stay in the package until rendering needs them.
     pub media: BTreeSet<String>,
+    /// Images generated while parsing (bitmaps inside metafiles), as PNG,
+    /// keyed by the media name used in `Picture::media`.
+    pub embedded: std::collections::BTreeMap<String, Vec<u8>>,
     pub warnings: Vec<Warning>,
 }
 
@@ -136,6 +139,8 @@ pub enum Geometry {
     Path(Vec<PathCmd>),
     /// Like `Path`, but only stroked (brackets and braces).
     Open(Vec<PathCmd>),
+    /// Like `Path`, filled with the even-odd rule (metafile polygons).
+    PathEvenOdd(Vec<PathCmd>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

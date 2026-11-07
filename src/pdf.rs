@@ -1074,8 +1074,11 @@ fn draw_geometry(page: &mut PageCtx, s: &Shape, shading: Option<&str>) {
     }
     trace(c, &s.geometry, (x, y, w, h), &map);
     let fill = fill.filter(|_| !open);
+    let eo = matches!(s.geometry, Geometry::PathEvenOdd(_));
     match (fill.is_some(), stroke.is_some()) {
         (_, false) if open => c.end_path(),
+        (true, true) if eo => c.fill_even_odd_and_stroke(),
+        (true, false) if eo => c.fill_even_odd(),
         (true, true) => c.fill_nonzero_and_stroke(),
         (true, false) => c.fill_nonzero(),
         _ => c.stroke(),
@@ -1113,23 +1116,39 @@ fn trace(c: &mut Content, g: &Geometry, (x, y, w, h): (f32, f32, f32, f32), map:
             c.cubic_to(cx + kx, cy - ry, cx + rx, cy - ky, cx + rx, cy);
             c.close_path();
         }
-        Geometry::Path(cmds) | Geometry::Open(cmds) => {
+        Geometry::Path(cmds) | Geometry::Open(cmds) | Geometry::PathEvenOdd(cmds) => {
+            // A segment needs a current point; paths that start without a
+            // move (or continue after a close) begin at the segment's end.
+            let mut has_point = false;
             for cmd in cmds {
                 match *cmd {
                     PathCmd::Move(u, v) => {
                         let p = map(u, v);
                         c.move_to(p.0, p.1);
+                        has_point = true;
                     }
                     PathCmd::Line(u, v) => {
                         let p = map(u, v);
-                        c.line_to(p.0, p.1);
+                        if has_point {
+                            c.line_to(p.0, p.1);
+                        } else {
+                            c.move_to(p.0, p.1);
+                            has_point = true;
+                        }
                     }
                     PathCmd::Cubic(a, b, cc, d, e, f) => {
                         let (p1, p2, p3) = (map(a, b), map(cc, d), map(e, f));
-                        c.cubic_to(p1.0, p1.1, p2.0, p2.1, p3.0, p3.1);
+                        if has_point {
+                            c.cubic_to(p1.0, p1.1, p2.0, p2.1, p3.0, p3.1);
+                        } else {
+                            c.move_to(p3.0, p3.1);
+                            has_point = true;
+                        }
                     }
                     PathCmd::Close => {
-                        c.close_path();
+                        if has_point {
+                            c.close_path();
+                        }
                     }
                 }
             }

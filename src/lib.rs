@@ -21,6 +21,7 @@ pub mod fonts;
 pub mod fragments;
 pub mod images;
 pub mod ir;
+mod metafile;
 mod metrics;
 pub mod pdf;
 pub mod pptx;
@@ -260,9 +261,10 @@ pub fn convert_stream<R: Read + Seek>(
     } else {
         opts.fonts.clone()
     };
+    let embedded = &deck.embedded;
     let mut r = pdf::Renderer::new(
         &deck,
-        Box::new(move |path: &str| pkg.read_media(path)),
+        Box::new(move |path: &str| embedded.get(path).cloned().or_else(|| pkg.read_media(path))),
         pdf::PdfOptions {
             image_dpi: opts.image_dpi,
             jpeg_quality: opts.jpeg_quality,
