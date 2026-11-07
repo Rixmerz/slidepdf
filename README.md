@@ -8,8 +8,8 @@ store slides on a CDN.
 
 
 - **Small PDFs.** Text uses the base-14 PDF fonts (zero font bytes), JPEGs pass
-  through untouched, oversized images are downsampled to the size they are
-  shown at, images are deduplicated, streams use Flate level 9 and the xref is
+  through untouched, photos saved as PNG become JPEG, oversized images are
+  downsampled to the size they are shown at, images are deduplicated, streams use Flate level 9 and the xref is
   a stream. A 4-slide test deck with two pictures is 16 KB (10 KB with the
   `light` preset); text-only slides are under 1 KB. A 7.9 MB deck with a
   4000x3000 photo becomes 42 KB (`light`), 97 KB (`balanced`) or 1 MB (`print`).
@@ -64,6 +64,21 @@ text. Register a TTF/OTF with `--font` to use the real typeface (matched by
 family name) and to cover characters outside WinAnsi (Greek, arrows...). Only
 the glyphs used are embedded. Characters that no font can draw become `?` and
 are listed in the report.
+
+Weights written in the typeface ("Montserrat Black", "Segoe UI Semibold")
+count: the run takes the registered file of the nearest weight, or the bold
+base-14 font from SemiBold up when none is registered. A variable font
+(`Montserrat[wght].ttf`) is embedded at the weight each run asks for. Every
+typeface drawn with a base-14 font instead (other than Arial, Helvetica,
+Times, Courier and Calibri) is listed in the report, since its line breaks
+may differ from PowerPoint's.
+
+### Images
+
+JPEGs are kept as they are unless much larger than the size they are shown
+at. A PNG that holds a photo (many distinct colours) is stored as JPEG at the
+preset's quality when that halves it or better; its transparency stays a
+lossless mask. Logos, diagrams and screenshots stay lossless.
 
 ## Performance and memory
 
@@ -239,6 +254,22 @@ been tested yet.
 ```
 
 Keys: arrows / PageUp / PageDown / Space, Home, End, `F` for fullscreen.
+
+Files behind authentication, your own pdf.js, your own texts (set these
+properties from JavaScript, before or after `manifest`):
+
+```js
+import * as pdfjsLib from "pdfjs-dist";            // 3.x or 4.x, worker set up by you
+const v = document.querySelector("slide-viewer");
+v.pdfjsLib = pdfjsLib;                              // default: pdf.js 3 from cdnjs (`pdfjs` attribute)
+v.requestInit = { headers: { Authorization: `Bearer ${token}` } };
+// or fetch every file yourself (kind is "manifest" or "slide"):
+v.loader = (url, kind) => fetch(api.mediaUrl(url), { headers });
+v.labels = { search: "Find a slide" };              // override any built-in text
+```
+
+The built-in texts are English, or Spanish with `lang="es"` on the element
+or an ancestor.
 
 Events (`event.detail`): `ready {count}`, `slidechange {number, previous}`,
 `slideviewed {number, ms}` (when leaving a slide), `completed {total, ms}`

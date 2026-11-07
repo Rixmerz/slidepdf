@@ -281,3 +281,48 @@ export interface SlideViewerEventMap {
   slideviewed: CustomEvent<{ number: number; ms: number }>;
   completed: CustomEvent<{ total: number; ms: number }>;
 }
+
+/** Texts of the viewer; `{message}` and `{number}` are filled in. */
+export interface SlideViewerLabels {
+  loading: string;
+  openError: string;
+  slideError: string;
+  prev: string;
+  next: string;
+  search: string;
+  searchLabel: string;
+  focus: string;
+  focusTitle: string;
+  fullscreen: string;
+  fullscreenTitle: string;
+  slides: string;
+  slide: string;
+}
+
+/**
+ * Fetches one file for the viewer: the manifest (`kind` "manifest") or a
+ * fragment ("slide"). `url` is already resolved against the manifest URL.
+ */
+export type SlideViewerLoader = (
+  url: string,
+  kind: "manifest" | "slide",
+) => Promise<Response | ArrayBuffer | Uint8Array | Blob | Manifest>;
+
+/** Properties of the `<slide-viewer>` element, set from JavaScript. */
+export interface SlideViewerElement extends HTMLElement {
+  /** fetch() options for the manifest and every fragment (headers, credentials). */
+  requestInit?: RequestInit;
+  /** Fetches every file itself; takes precedence over `requestInit`. */
+  loader?: SlideViewerLoader;
+  /** A pdf.js module (3.x or 4.x) with its worker set up, instead of the CDN build. */
+  pdfjsLib?: unknown;
+  /** Overrides some or all built-in texts (English, or Spanish with lang="es"). */
+  labels?: Partial<SlideViewerLabels>;
+  readonly count: number;
+  next(): void;
+  prev(): void;
+  goTo(number: number): void;
+  toggleFocus(): void;
+  toggleFullscreen(): void;
+  search(text: string): number[];
+}

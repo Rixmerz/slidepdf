@@ -9,6 +9,22 @@
 //   pdfjs          base URL of a pdf.js 3.x build (default: cdnjs)
 //   show-warnings  show the fidelity warnings of the current slide
 //   view-threshold ms on screen before a slide counts as viewed (default 2000)
+//   lang           language of the built-in texts: en (default) or es; the
+//                  nearest ancestor's lang applies when the element has none
+//
+// Properties (set from JavaScript, before or after `manifest`):
+//   requestInit  fetch() options for the manifest and every fragment, e.g.
+//                { headers: { Authorization: "Bearer ..." }, credentials: "include" }
+//   loader       async (url, kind) => Response | ArrayBuffer | Uint8Array | Blob
+//                (or, for kind "manifest", the parsed object): fetches every
+//                file itself; kind is "manifest" or "slide", url is already
+//                resolved against the manifest. Takes precedence over requestInit.
+//   pdfjsLib     a pdf.js module you already load (3.x or 4.x, worker set up),
+//                instead of the global build from the `pdfjs` attribute
+//   labels       { loading, openError, slideError, prev, next, search,
+//                  searchLabel, focus, focusTitle, fullscreen, fullscreenTitle,
+//                  slides, slide } overriding the built-in texts; {message}
+//                  and {number} are filled in
 //
 // Events (all bubble, details in `event.detail`):
 //   ready        { count }
@@ -51,6 +67,42 @@ function loadPdfJs(base) {
     });
   }
   return pdfjsPromise;
+}
+
+const LABELS = {
+  en: {
+    loading: "Loading...", openError: "Could not open the presentation: {message}",
+    slideError: "Could not load this slide", prev: "Previous slide", next: "Next slide",
+    search: "Search", searchLabel: "Search slides", focus: "Large slide",
+    focusTitle: "Large slide (hide thumbnails)", fullscreen: "Fullscreen",
+    fullscreenTitle: "Fullscreen (F)", slides: "Slides", slide: "Slide {number}",
+  },
+  es: {
+    loading: "Cargando...", openError: "No se pudo abrir la presentación: {message}",
+    slideError: "No se pudo cargar esta lámina", prev: "Lámina anterior", next: "Lámina siguiente",
+    search: "Buscar", searchLabel: "Buscar en las láminas", focus: "Lámina grande",
+    focusTitle: "Lámina grande (oculta las miniaturas)", fullscreen: "Pantalla completa",
+    fullscreenTitle: "Pantalla completa (F)", slides: "Láminas", slide: "Lámina {number}",
+  },
+};
+
+// What a loader or fetch returned, as bytes or as the manifest object.
+async function asBytes(r) {
+  if (r instanceof Response) {
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return new Uint8Array(await r.arrayBuffer());
+  }
+  if (r instanceof Uint8Array) return r;
+  if (r instanceof ArrayBuffer) return new Uint8Array(r);
+  if (typeof Blob !== "undefined" && r instanceof Blob) return new Uint8Array(await r.arrayBuffer());
+  throw new Error("loader returned no data");
+}
+
+async function asJson(r) {
+  if (r && typeof r === "object" && !(r instanceof Response) && !(r instanceof ArrayBuffer)
+      && !ArrayBuffer.isView(r) && !(typeof Blob !== "undefined" && r instanceof Blob)) return r;
+  if (typeof r === "string") return JSON.parse(r);
+  return JSON.parse(new TextDecoder().decode(await asBytes(r)));
 }
 
 // Accent- and case-insensitive text for search.
@@ -105,7 +157,7 @@ const CSS = `
 `;
 
 class SlideViewer extends HTMLElement {
-  static get observedAttributes() { return ["manifest"]; }
+  static get observedAttributes() { return ["manifest", "lang"]; }
 
   constructor() {
     super();
@@ -118,33 +170,94 @@ class SlideViewer extends HTMLElement {
     this._startedAt = 0;
     this._completed = false;
     this._renderToken = 0;
+    this._labels = {};
+  }
+
+  get requestInit() { return this._requestInit; }
+  set requestInit(v) { this._requestInit = v || undefined; this._scheduleLoad(); }
+  get loader() { return this._loader; }
+  set loader(fn) { this._loader = typeof fn === "function" ? fn : undefined; this._scheduleLoad(); }
+  get pdfjsLib() { return this._pdfjs; }
+  set pdfjsLib(lib) { this._pdfjs = lib || undefined; this._scheduleLoad(); }
+  get labels() { return this._labels; }
+  set labels(v) { this._labels = v || {}; this._applyLabels(); }
+
+  _t(key, vars = {}) {
+    const el = this.closest("[lang]");
+    const lang = ((el && el.getAttribute("lang")) || "en").toLowerCase().split("-")[0];
+    const text = this._labels[key] ?? (LABELS[lang] || LABELS.en)[key] ?? LABELS.en[key];
+    return String(text).replace(/\{(\w+)\}/g, (m, k) => (k in vars ? vars[k] : m));
+  }
+
+  _applyLabels() {
+    if (!this.shadowRoot.firstChild) return;
+    this.shadowRoot.querySelectorAll("[data-l]").forEach((e) => (e.textContent = this._t(e.dataset.l)));
+    for (const attr of ["aria-label", "title", "placeholder"]) {
+      this.shadowRoot.querySelectorAll(`[data-l-${attr}]`).forEach((e) => e.setAttribute(attr, this._t(e.getAttribute(`data-l-${attr}`))));
+    }
+    if (this.manifest) {
+      this._els.thumbs.querySelectorAll(".thumb").forEach((b, i) => b.setAttribute("aria-label", this._thumbLabel(this.manifest.slides[i])));
+    }
+  }
+
+  _thumbLabel(s) { return this._t("slide", { number: s.number }) + (s.title ? `: ${s.title}` : ""); }
+
+  // Settings usually arrive together (a framework sets every binding in one
+  // pass): load once, after all of them, instead of once per change.
+  _scheduleLoad() {
+    if (this._loadQueued) return;
+    this._loadQueued = true;
+    queueMicrotask(() => {
+      this._loadQueued = false;
+      if (this._els && this.getAttribute("manifest")) this._load();
+    });
+  }
+
+  async _fetchManifest(url) {
+    if (this._loader) return asJson(await this._loader(url.href, "manifest"));
+    const res = await fetch(url, this._requestInit);
+    if (!res.ok) throw new Error(`manifest: HTTP ${res.status}`);
+    return res.json();
+  }
+
+  // Opens fragment i as a pdf.js document, through the loader or with the
+  // request options when given.
+  async _open(i) {
+    const url = new URL(this.manifest.slides[i].file, this._base).href;
+    if (this._loader) return this._lib.getDocument({ data: await asBytes(await this._loader(url, "slide")) }).promise;
+    const params = { url, disableAutoFetch: true };
+    const init = this._requestInit;
+    if (init && init.headers) params.httpHeaders = Object.fromEntries(new Headers(init.headers));
+    if (init && init.credentials === "include") params.withCredentials = true;
+    return this._lib.getDocument(params).promise;
   }
 
   connectedCallback() {
     this.shadowRoot.innerHTML = `<style>${CSS}</style>
       <div class="wrap" part="frame">
         <div class="stage" part="stage">
-          <div class="page" part="page"><canvas></canvas><div class="loading">Loading...</div></div>
-          <button class="nav prev" part="nav nav-prev" aria-label="Previous slide"><slot name="prev-icon">&#8249;</slot></button>
-          <button class="nav next" part="nav nav-next" aria-label="Next slide"><slot name="next-icon">&#8250;</slot></button>
+          <div class="page" part="page"><canvas></canvas><div class="loading" data-l="loading"></div></div>
+          <button class="nav prev" part="nav nav-prev" data-l-aria-label="prev"><slot name="prev-icon">&#8249;</slot></button>
+          <button class="nav next" part="nav nav-next" data-l-aria-label="next"><slot name="next-icon">&#8250;</slot></button>
         </div>
         <div class="bar" part="bar">
           <slot name="bar-start"></slot>
-          <button data-act="prev" part="button button-prev" aria-label="Previous slide">&#8592;</button>
+          <button data-act="prev" part="button button-prev" data-l-aria-label="prev">&#8592;</button>
           <span class="count" part="counter" aria-live="polite">- / -</span>
-          <button data-act="next" part="button button-next" aria-label="Next slide">&#8594;</button>
+          <button data-act="next" part="button button-next" data-l-aria-label="next">&#8594;</button>
           <span class="warn" part="warning" title="">&#9888;</span>
           <span class="title" part="title"></span>
-          <input type="search" part="search" placeholder="Search" aria-label="Search slides">
-          <button data-act="focus" part="button button-focus" title="Large slide (hide thumbnails)" aria-label="Large slide"><slot name="focus-icon">&#9635;</slot></button>
-          <button data-act="fullscreen" part="button button-fullscreen" title="Fullscreen (F)" aria-label="Fullscreen"><slot name="fullscreen-icon">&#x26F6;</slot></button>
+          <input type="search" part="search" data-l-placeholder="search" data-l-aria-label="searchLabel">
+          <button data-act="focus" part="button button-focus" data-l-title="focusTitle" data-l-aria-label="focus"><slot name="focus-icon">&#9635;</slot></button>
+          <button data-act="fullscreen" part="button button-fullscreen" data-l-title="fullscreenTitle" data-l-aria-label="fullscreen"><slot name="fullscreen-icon">&#x26F6;</slot></button>
           <slot name="bar-end"></slot>
         </div>
-        <div class="thumbs" part="thumbs" role="listbox" aria-label="Slides"></div>
+        <div class="thumbs" part="thumbs" role="listbox" data-l-aria-label="slides"></div>
       </div>`;
     const $ = (s) => this.shadowRoot.querySelector(s);
     this._els = { stage: $(".stage"), page: $(".page"), canvas: $(".page canvas"), loading: $(".loading"),
       count: $(".count"), title: $(".title"), thumbs: $(".thumbs"), warn: $(".warn"), search: $("input") };
+    this._applyLabels();
     $(".nav.prev").onclick = () => this.prev();
     $(".nav.next").onclick = () => this.next();
     this.shadowRoot.querySelectorAll(".bar button").forEach((b) => {
@@ -164,7 +277,7 @@ class SlideViewer extends HTMLElement {
     this._onHide = () => { if (document.visibilityState === "hidden") this._leave(); else this._enteredAt = performance.now(); };
     document.addEventListener("visibilitychange", this._onHide);
     this._wireSwipe();
-    if (this.getAttribute("manifest")) this._load();
+    this._scheduleLoad();
   }
 
   disconnectedCallback() {
@@ -176,7 +289,9 @@ class SlideViewer extends HTMLElement {
   }
 
   attributeChangedCallback(name, oldV, newV) {
-    if (name === "manifest" && oldV !== newV && this._els) this._load();
+    if (oldV === newV || !this._els) return;
+    if (name === "manifest") this._scheduleLoad();
+    else this._applyLabels();
   }
 
   get count() { return this.manifest ? this.manifest.slides.length : 0; }
@@ -193,13 +308,13 @@ class SlideViewer extends HTMLElement {
     // Only the latest load may finish: a slower earlier fetch is dropped.
     const load = (this._loadId = (this._loadId || 0) + 1);
     const url = new URL(this.getAttribute("manifest"), document.baseURI);
+    this._els.loading.style.display = "grid";
+    this._els.loading.textContent = this._t("loading");
     try {
-      const [lib, res] = await Promise.all([loadPdfJs(this.getAttribute("pdfjs") || DEFAULT_PDFJS), fetch(url)]);
+      const lib = this._pdfjs ? Promise.resolve(this._pdfjs) : loadPdfJs(this.getAttribute("pdfjs") || DEFAULT_PDFJS);
+      const [pdfjs, manifest] = await Promise.all([lib, this._fetchManifest(url)]);
       if (load !== this._loadId) return;
-      if (!res.ok) throw new Error(`manifest: HTTP ${res.status}`);
-      this._lib = lib;
-      const manifest = await res.json();
-      if (load !== this._loadId) return;
+      this._lib = pdfjs;
       this.manifest = manifest;
       this._base = url;
       this._seen.clear();
@@ -215,14 +330,13 @@ class SlideViewer extends HTMLElement {
       if (load !== this._loadId) return;
       // textContent, not innerHTML: messages can echo server or manifest data.
       this._els.loading.style.display = "grid";
-      this._els.loading.textContent = `Could not open the presentation: ${e.message}`;
+      this._els.loading.textContent = this._t("openError", { message: e.message });
     }
   }
 
   _doc(i) {
     if (!this._docs.has(i)) {
-      const src = new URL(this.manifest.slides[i].file, this._base).href;
-      const p = this._lib.getDocument({ url: src, disableAutoFetch: true }).promise;
+      const p = this._open(i);
       p.catch(() => this._docs.delete(i));
       this._docs.set(i, p);
     }
@@ -243,8 +357,7 @@ class SlideViewer extends HTMLElement {
   // Thumbnails open their fragment, draw it small and close it right away.
   async _drawThumb(i, canvas, cssWidth) {
     if (this._docs.has(i)) return this._draw(i, canvas, cssWidth);
-    const src = new URL(this.manifest.slides[i].file, this._base).href;
-    const doc = await this._lib.getDocument({ url: src, disableAutoFetch: true }).promise;
+    const doc = await this._open(i);
     try {
       await this._render(doc, canvas, cssWidth);
     } finally {
@@ -285,6 +398,7 @@ class SlideViewer extends HTMLElement {
     const token = ++this._renderToken;
     const width = this._fit();
     this._els.loading.style.display = "grid";
+    this._els.loading.textContent = this._t("loading");
     try {
       const canvas = document.createElement("canvas");
       await this._draw(this.current, canvas, width);
@@ -293,7 +407,7 @@ class SlideViewer extends HTMLElement {
       this._els.canvas = canvas;
       this._els.loading.style.display = "none";
     } catch {
-      if (token === this._renderToken) this._els.loading.textContent = "Could not load this slide";
+      if (token === this._renderToken) this._els.loading.textContent = this._t("slideError");
     }
     // Prefetch neighbours so the next click is instant, and drop the rest.
     [this.current + 1, this.current - 1].filter((j) => j >= 0 && j < this.count).forEach((j) => this._doc(j));
@@ -317,7 +431,7 @@ class SlideViewer extends HTMLElement {
       b.className = "thumb";
       b.dataset.i = i;
       b.setAttribute("role", "option");
-      b.setAttribute("aria-label", `Slide ${s.number}${s.title ? ": " + s.title : ""}`);
+      b.setAttribute("aria-label", this._thumbLabel(s));
       b.style.height = `${120 * this._ratio}px`;
       b.setAttribute("part", "thumb");
       const num = document.createElement("span");
