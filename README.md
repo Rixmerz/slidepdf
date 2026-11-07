@@ -62,8 +62,13 @@ Without registered fonts, text is drawn in Helvetica / Times / Courier
 (matched by the deck's typeface), which covers Spanish and Western European
 text. Register a TTF/OTF with `--font` to use the real typeface (matched by
 family name) and to cover characters outside WinAnsi (Greek, arrows...). Only
-the glyphs used are embedded. Characters that no font can draw become `?` and
-are listed in the report.
+the glyphs used are embedded. A character outside WinAnsi is drawn with any
+registered font that has the glyph when the run's own typeface is not
+registered or lacks it (same slant first, then the nearest weight, then
+registration order), so registering one broad font such as Noto Sans gives
+Greek and Cyrillic to every typeface, while Latin text keeps using the base-14
+fonts. Characters that no font can draw become `?` and are listed in the
+report.
 
 Weights written in the typeface ("Montserrat Black", "Segoe UI Semibold")
 count: the run takes the registered file of the nearest weight, or the bold
