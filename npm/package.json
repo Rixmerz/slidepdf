@@ -44,7 +44,7 @@
     "viewer"
   ],
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/convert.test.js"
   },
   "repository": {
     "type": "git",
