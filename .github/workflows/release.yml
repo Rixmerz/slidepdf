@@ -28,7 +28,14 @@ jobs:
       - run: scripts/build-npm.sh
       - name: Check the tag matches package.json
         run: test "v$(node -p "require('./npm/package.json').version")" = "${GITHUB_REF_NAME}"
-      - run: npm publish --provenance --access public
+      - name: Skip if this version is already on npm
+        id: published
+        run: |
+          if npm view "slidepdf@$(node -p "require('./npm/package.json').version")" version >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.published.outputs.skip != 'true'
+        run: npm publish --provenance --access public
         working-directory: npm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
