@@ -7,6 +7,9 @@
 //! - PNG is decoded, alpha goes to a separate soft mask, and pixels are
 //!   re-compressed with PNG row predictors + Flate, which is what PNG itself
 //!   does, so the stream ends up about as small as the original file.
+//!   A PNG that is really a photo is re-encoded as JPEG instead (feature
+//!   `downsample`) when that is much smaller; its alpha stays a lossless
+//!   soft mask.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ColorSpace {
@@ -321,15 +324,111 @@ fn png_image(bytes: &[u8], t: Target) -> Result<Prepared, String> {
     } else {
         (out, None)
     };
+    #[cfg(feature = "downsample")]
+    let mut color = color;
+    let flate = predict_and_deflate(&color, ow as usize, comps);
+    #[cfg(feature = "downsample")]
+    {
+        if let Some(a) = &alpha {
+            // JPEG blocks mix neighbouring pixels: give transparent pixels
+            // the colour of the visible ones next to them, so no dark or
+            // light fringe shows through the soft mask at the edges.
+            bleed_transparent(&mut color, a, ow as usize, comps);
+        }
+        if let Some(jpeg) = photo_as_jpeg(&color, ow, oh, space, flate.len(), t.jpeg_quality) {
+            return Ok(Prepared {
+                width: ow,
+                height: oh,
+                space,
+                data: jpeg,
+                dct: true,
+                invert: false,
+                smask: alpha.map(|a| predict_and_deflate(&a, ow as usize, 1)),
+            });
+        }
+    }
     Ok(Prepared {
         width: ow,
         height: oh,
         space,
-        data: predict_and_deflate(&color, ow as usize, comps),
+        data: flate,
         dct: false,
         invert: false,
         smask: alpha.map(|a| predict_and_deflate(&a, ow as usize, 1)),
     })
+}
+
+/// A picture saved as PNG (a photo pasted into a deck, a scan) is
+/// often ten times larger lossless than as JPEG. Returns the JPEG only when
+/// the pixels look photographic (many distinct colors) and the JPEG is much
+/// smaller, so logos, diagrams and screenshots keep their sharp edges.
+#[cfg(feature = "downsample")]
+fn photo_as_jpeg(px: &[u8], w: u32, h: u32, space: ColorSpace, flate_len: usize, quality: u8) -> Option<Vec<u8>> {
+    // Below this the lossless stream is already cheap.
+    const MIN_FLATE: usize = 48 * 1024;
+    // Flat graphics (even anti-aliased text) stay well under this.
+    const PHOTO_COLORS: usize = 8192;
+    if flate_len < MIN_FLATE || w > u16::MAX as u32 || h > u16::MAX as u32 {
+        return None;
+    }
+    if distinct_colors(px, space.comps(), PHOTO_COLORS) < PHOTO_COLORS {
+        return None;
+    }
+    let jpeg = encode_jpeg(px, w, h, space, quality).ok()?;
+    (jpeg.len() * 2 < flate_len).then_some(jpeg)
+}
+
+/// Copies the colour of the nearest visible pixel into fully transparent
+/// ones: along each row first, then from the row above for rows with no
+/// visible pixel at all.
+#[cfg(feature = "downsample")]
+fn bleed_transparent(px: &mut [u8], alpha: &[u8], w: usize, comps: usize) {
+    if w == 0 {
+        return;
+    }
+    let stride = w * comps;
+    let mut prev_visible_row: Option<usize> = None;
+    for (y, row_alpha) in alpha.chunks_exact(w).enumerate() {
+        let row = y * stride;
+        let Some(first) = row_alpha.iter().position(|&a| a > 0) else {
+            if let Some(src) = prev_visible_row {
+                px.copy_within(src * stride..(src + 1) * stride, row);
+            }
+            continue;
+        };
+        // Leading transparent run takes the first visible pixel.
+        for x in 0..first {
+            px.copy_within(row + first * comps..row + (first + 1) * comps, row + x * comps);
+        }
+        let mut last = first;
+        for (x, &a) in row_alpha.iter().enumerate().skip(first + 1) {
+            if a > 0 {
+                last = x;
+            } else {
+                px.copy_within(row + last * comps..row + (last + 1) * comps, row + x * comps);
+            }
+        }
+        if prev_visible_row.is_none() {
+            // Fully transparent rows above the first visible one.
+            for yy in 0..y {
+                px.copy_within(row..row + stride, yy * stride);
+            }
+        }
+        prev_visible_row = Some(y);
+    }
+}
+
+/// Counts distinct pixel values, stopping at `cap`.
+#[cfg(feature = "downsample")]
+fn distinct_colors(px: &[u8], comps: usize, cap: usize) -> usize {
+    let mut seen = std::collections::HashSet::with_capacity(cap);
+    for p in px.chunks_exact(comps) {
+        let v = p.iter().fold(0u32, |acc, &b| (acc << 8) | b as u32);
+        if seen.insert(v) && seen.len() >= cap {
+            break;
+        }
+    }
+    seen.len()
 }
 
 /// First frame of a GIF (animation is not representable in PDF).
@@ -597,6 +696,87 @@ mod tests {
     fn box_resize_averages() {
         let src = [0, 100, 200, 255];
         assert_eq!(resize(&src, 2, 2, 1, 1, 1), vec![139]);
+    }
+
+    fn encode_png(px: &[u8], w: u32, h: u32, ct: png::ColorType) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, w, h);
+        enc.set_color(ct);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(px).unwrap();
+        out
+    }
+
+    /// Smooth shading plus a little grain: what a photo looks like to us.
+    fn photo(w: u32, h: u32, alpha: bool) -> Vec<u8> {
+        let mut seed = 12345u32;
+        let mut px = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+                let n = (seed >> 16) as i32 % 9 - 4;
+                let f = |v: f32| (v.clamp(0.0, 255.0) as i32 + n).clamp(0, 255) as u8;
+                px.push(f(x as f32 * 255.0 / w as f32));
+                px.push(f(128.0 + 100.0 * (y as f32 / 23.0).sin()));
+                px.push(f(y as f32 * 255.0 / h as f32));
+                if alpha {
+                    // Rounded-corner style cut-out: transparent outside a disc.
+                    let (dx, dy) = (x as f32 - w as f32 / 2.0, y as f32 - h as f32 / 2.0);
+                    px.push(if dx * dx + dy * dy < (w as f32 / 2.0).powi(2) { 255 } else { 0 });
+                }
+            }
+        }
+        px
+    }
+
+    const KEEP: Target = Target {
+        max_px: None,
+        jpeg_quality: 75,
+    };
+
+    #[cfg(feature = "downsample")]
+    #[test]
+    fn photographic_png_becomes_jpeg() {
+        let png = encode_png(&photo(600, 400, false), 600, 400, png::ColorType::Rgb);
+        let p = prepare(&png, KEEP).unwrap();
+        assert!(p.dct, "an opaque photo should be stored as JPEG");
+        assert!(p.data.len() * 2 < png.len());
+        assert!(p.smask.is_none());
+    }
+
+    #[cfg(feature = "downsample")]
+    #[test]
+    fn photographic_png_with_alpha_keeps_a_lossless_mask() {
+        let png = encode_png(&photo(600, 400, true), 600, 400, png::ColorType::Rgba);
+        let p = prepare(&png, KEEP).unwrap();
+        assert!(p.dct);
+        let mask = miniz_oxide::inflate::decompress_to_vec_zlib(p.smask.as_ref().unwrap()).unwrap();
+        assert_eq!(mask.len(), 400 * (600 + 1));
+    }
+
+    #[test]
+    fn flat_graphics_stay_lossless() {
+        // Large blocks of a few colours: a diagram or screenshot.
+        let (w, h) = (600u32, 400u32);
+        let mut px = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                let c = [[212, 27, 0], [255, 255, 255], [20, 24, 40]][((x / 50 + y / 40) % 3) as usize];
+                px.extend_from_slice(&c);
+            }
+        }
+        let p = prepare(&encode_png(&px, w, h, png::ColorType::Rgb), KEEP).unwrap();
+        assert!(!p.dct);
+    }
+
+    #[cfg(feature = "downsample")]
+    #[test]
+    fn transparent_pixels_take_visible_neighbours() {
+        // 3x2 RGB, alpha: row 0 = [0, 255, 0], row 1 fully transparent.
+        let mut px = vec![9, 9, 9, 100, 110, 120, 7, 7, 7, 1, 1, 1, 2, 2, 2, 3, 3, 3];
+        bleed_transparent(&mut px, &[0, 255, 0, 0, 0, 0], 3, 3);
+        assert_eq!(&px[..9], &[100, 110, 120, 100, 110, 120, 100, 110, 120]);
+        assert_eq!(&px[9..], &px[..9].to_vec()[..]);
     }
 
     #[test]

@@ -292,7 +292,8 @@ pub fn convert_stream_with<R: Read + Seek>(
     let fonts = if opts.preset == Preset::Light {
         Vec::new()
     } else {
-        opts.fonts.clone()
+        // A variable font becomes one face per weight it covers.
+        opts.fonts.iter().flat_map(FontFile::instances).collect()
     };
     let embedded = &deck.embedded;
     let mut r = pdf::Renderer::new(
