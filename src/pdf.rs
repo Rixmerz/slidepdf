@@ -16,7 +16,7 @@ use std::rc::Rc;
 use pdf_writer::types::{FunctionShadingType, Predictor};
 use pdf_writer::{Chunk, Content, Filter, Name, Rect as PRect, Ref, Settings, Str};
 
-use crate::fonts::{subset_tag, FontFile, Usage};
+use crate::fonts::{face_style, run_weight, subset_tag, FontFile, Usage};
 use crate::images::{self, ColorSpace, Prepared, Target};
 use crate::ir::*;
 use crate::metrics;
@@ -87,19 +87,56 @@ struct Fonts<'f, 'u> {
     usage: &'u mut [Usage],
     /// Characters no available font could draw on the current slide.
     missing: Vec<char>,
+    /// Typefaces drawn with a base-14 font instead, with that font's family.
+    substituted: Vec<(String, &'static str)>,
 }
 
+/// Typefaces the base-14 fonts stand in for without visible loss: the
+/// same design (Arial/Helvetica, Times, Courier) or one whose metrics we
+/// ship so lines still break in the same place (Calibri).
+const NATIVE_FAMILIES: [&str; 9] = [
+    "arial",
+    "helvetica",
+    "helvetica neue",
+    "times",
+    "times new roman",
+    "courier",
+    "courier new",
+    "calibri",
+    "",
+];
+
 impl Fonts<'_, '_> {
+    /// The registered face for a run: same family (by the name the deck
+    /// uses), same slant first, then the nearest weight; on a tie a bold
+    /// request takes the heavier face and a light one the lighter, as CSS
+    /// does.
     fn matching(&self, r: &Run) -> Option<usize> {
-        let face = r.face.to_lowercase();
-        if face.is_empty() {
+        if r.face.is_empty() || self.files.is_empty() {
             return None;
         }
-        let same: Vec<usize> = (0..self.files.len()).filter(|&i| self.files[i].family == face).collect();
-        same.iter()
-            .copied()
-            .find(|&i| self.files[i].bold == r.bold && self.files[i].italic == r.italic)
-            .or_else(|| same.first().copied())
+        let (family, _, named_italic) = face_style(&r.face);
+        let full = r.face.to_lowercase();
+        let weight = run_weight(&r.face, r.bold) as i32;
+        let italic = r.italic || named_italic;
+        (0..self.files.len())
+            .filter(|&i| self.files[i].family == family || self.files[i].family == full)
+            .min_by_key(|&i| {
+                let f = &self.files[i];
+                let lighter = (f.weight as i32) < weight;
+                (f.italic != italic, (f.weight as i32 - weight).abs(), lighter == (weight >= 400))
+            })
+    }
+
+    fn note_substitution(&mut self, r: &Run, key: FontKey) {
+        if self.substituted.iter().any(|(f, _)| *f == r.face) {
+            return;
+        }
+        let (family, ..) = face_style(&r.face);
+        if !NATIVE_FAMILIES.contains(&family.as_str()) {
+            // Named by family only: the same typeface is drawn bold and regular.
+            self.substituted.push((r.face.clone(), FontKey(key.0, false, false).base_name()));
+        }
     }
 
     fn glyph(&mut self, r: &Run, run: usize, c: char) -> Glyph {
@@ -116,12 +153,17 @@ impl Fonts<'_, '_> {
                 run,
             })
         };
-        if let Some(i) = self.matching(r) {
+        let matched = self.matching(r);
+        if let Some(i) = matched {
             if let Some(g) = emb(self, i) {
                 return g;
             }
         }
         let key = FontKey::of(r);
+        // A registered font lacking one character is not a missing font.
+        if matched.is_none() && !space {
+            self.note_substitution(r, key);
+        }
         if let Some(b) = winansi(c) {
             let nat = char_width(key, b) * 1000.0;
             let adv = metric_width(&r.face, key, b).map(|w| w * 1000.0).unwrap_or(nat);
@@ -187,8 +229,12 @@ impl FontKey {
         })
     }
 
+    /// "Montserrat Black" is a bold face even when the run is not marked
+    /// bold: the weight named in the typeface counts too.
     fn of(r: &Run) -> Self {
-        FontKey(r.family, r.bold, r.italic)
+        let (_, weight, named_italic) = face_style(&r.face);
+        let bold = r.bold || weight.is_some_and(|w| w >= 600);
+        FontKey(r.family, bold, r.italic || named_italic)
     }
 }
 
@@ -571,6 +617,7 @@ impl<'d> Renderer<'d> {
         // Font files are moved out for the slide to keep borrows simple.
         let font_files = std::mem::take(&mut self.opts.fonts);
         let mut missing = Vec::new();
+        let mut substituted = Vec::new();
         for e in &slide.elements {
             match e {
                 Element::Picture(p) => {
@@ -613,6 +660,7 @@ impl<'d> Renderer<'d> {
                             files: &font_files,
                             usage: &mut doc.usage,
                             missing: std::mem::take(&mut missing),
+                            substituted: std::mem::take(&mut substituted),
                         };
                         let r = *s.text_rect.as_ref().unwrap_or(&s.rect);
                         if t.rotation.abs() > 0.01 {
@@ -637,6 +685,7 @@ impl<'d> Renderer<'d> {
                             draw_text(&mut page, &r, t, &mut fset);
                         }
                         missing = fset.missing;
+                        substituted = fset.substituted;
                     }
                     page.c.restore_state();
                 }
@@ -644,6 +693,18 @@ impl<'d> Renderer<'d> {
         }
         self.opts.fonts = font_files;
 
+        for (face, base) in substituted {
+            // Deck-wide, once per typeface: the same font is usually on every slide.
+            let w = Warning {
+                slide: None,
+                message: format!(
+                    "font '{face}' is not available and was drawn with {base}; line breaks may differ (register the font file to embed it)"
+                ),
+            };
+            if !self.warnings.contains(&w) {
+                self.warnings.push(w);
+            }
+        }
         if !missing.is_empty() {
             let chars: String = missing.into_iter().collect();
             let w = Warning {
@@ -1513,6 +1574,106 @@ mod tests {
         }
     }
 
+    fn face(family: &str, weight: u16, italic: bool) -> FontFile {
+        FontFile {
+            data: std::sync::Arc::from(Vec::new()),
+            family: family.into(),
+            postscript_name: String::new(),
+            bold: weight >= 600,
+            italic,
+            weight,
+            weight_axis: None,
+            instance: None,
+            units_per_em: 1000.0,
+            ascent: 0.0,
+            descent: 0.0,
+            cap_height: 0.0,
+            italic_angle: 0.0,
+            bbox: [0.0; 4],
+        }
+    }
+
+    fn run(face: &str, bold: bool, italic: bool) -> Run {
+        Run {
+            text: "x".into(),
+            size: 12.0,
+            bold,
+            italic,
+            underline: false,
+            color: Rgb::BLACK,
+            family: Family::Sans,
+            face: face.into(),
+            line_break: false,
+        }
+    }
+
+    #[test]
+    fn runs_take_the_registered_face_of_the_nearest_weight() {
+        let files = [
+            face("montserrat", 400, false),
+            face("montserrat", 800, false),
+            face("montserrat", 900, false),
+            face("montserrat", 400, true),
+            face("outfit", 700, false),
+        ];
+        let fonts = Fonts {
+            files: &files,
+            usage: &mut [],
+            missing: Vec::new(),
+            substituted: Vec::new(),
+        };
+        assert_eq!(fonts.matching(&run("Montserrat Black", false, false)), Some(2));
+        assert_eq!(fonts.matching(&run("Montserrat ExtraBold", false, false)), Some(1));
+        // Bold asks for 700: the 800 file is nearer than the 400 one.
+        assert_eq!(fonts.matching(&run("Montserrat", true, false)), Some(1));
+        assert_eq!(fonts.matching(&run("Montserrat", false, true)), Some(3));
+        assert_eq!(fonts.matching(&run("Montserrat Medium", false, false)), Some(0));
+        assert_eq!(fonts.matching(&run("Inter", false, false)), None);
+    }
+
+    #[test]
+    fn a_weight_in_the_typeface_name_draws_bold() {
+        assert_eq!(FontKey::of(&run("Montserrat Black", false, false)).base_name(), "Helvetica-Bold");
+        assert_eq!(FontKey::of(&run("Montserrat Light", false, false)).base_name(), "Helvetica");
+        assert_eq!(
+            FontKey::of(&run("Montserrat Italic", false, false)).base_name(),
+            "Helvetica-Oblique"
+        );
+    }
+
+    #[test]
+    fn unregistered_typefaces_are_reported_once() {
+        let mut fonts = Fonts {
+            files: &[],
+            usage: &mut [],
+            missing: Vec::new(),
+            substituted: Vec::new(),
+        };
+        for r in [
+            run("Montserrat", false, false),
+            run("Montserrat", true, false),
+            run("Arial", false, false),
+        ] {
+            fonts.glyph(&r, 0, 'a');
+        }
+        assert_eq!(fonts.substituted, vec![("Montserrat".to_string(), "Helvetica")]);
+    }
+
+    #[test]
+    fn a_character_missing_from_a_registered_font_is_not_a_missing_font() {
+        // The file has no usable glyphs, so every character falls back.
+        let files = [face("montserrat", 400, false)];
+        let mut usage = [Usage::default()];
+        let mut fonts = Fonts {
+            files: &files,
+            usage: &mut usage,
+            missing: Vec::new(),
+            substituted: Vec::new(),
+        };
+        fonts.glyph(&run("Montserrat", false, false), 0, '→');
+        assert!(fonts.substituted.is_empty());
+    }
+
     #[test]
     fn spanish_text_is_winansi() {
         for c in "áéíóúñÑ¿¡ü€–—•“”".chars() {
@@ -1549,6 +1710,7 @@ mod tests {
             files: &[],
             usage: &mut [],
             missing: Vec::new(),
+            substituted: Vec::new(),
         };
         let lines = layout_paragraph(&p, 1.0, 60.0, 60.0, true, &mut fonts);
         assert_eq!(lines.len(), 2);
