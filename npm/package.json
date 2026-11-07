@@ -1,0 +1,61 @@
+{
+  "name": "slidepdf",
+  "version": "0.1.0",
+  "description": "Ultra-light PPTX to PDF converter (WebAssembly) with per-slide PDF fragments, reassembly and a <slide-viewer> web component",
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "node": "./node.js",
+      "default": "./web.js"
+    },
+    "./lite": {
+      "types": "./index.d.ts",
+      "node": "./lite/node.js",
+      "default": "./lite/web.js"
+    },
+    "./viewer": "./viewer/slide-viewer.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "node.js",
+    "node-api.js",
+    "web.js",
+    "web-api.js",
+    "common.js",
+    "lite/",
+    "index.d.ts",
+    "dist/",
+    "viewer/",
+    "README.md"
+  ],
+  "sideEffects": [
+    "./viewer/slide-viewer.js"
+  ],
+  "keywords": [
+    "pptx",
+    "pdf",
+    "powerpoint",
+    "converter",
+    "wasm",
+    "slides",
+    "viewer"
+  ],
+  "scripts": {
+    "test": "node --test test/"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rixmerz/slidepdf.git",
+    "directory": "npm"
+  },
+  "homepage": "https://github.com/Rixmerz/slidepdf#readme",
+  "bugs": {
+    "url": "https://github.com/Rixmerz/slidepdf/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

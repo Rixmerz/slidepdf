@@ -1,0 +1,87 @@
+<main>
+  <header>
+    <h1>slidepdf demo</h1>
+    <p>Upload a PPTX. The Node server converts it with <code>slidepdf</code>, stores one PDF per slide, and the viewer loads them lazily.</p>
+  </header>
+
+  <section class="controls">
+    <label>
+      Preset
+      <select [value]="preset()" (change)="preset.set($any($event.target).value)">
+        <option value="light">light (smallest)</option>
+        <option value="balanced">balanced</option>
+        <option value="print">print</option>
+      </select>
+    </label>
+    <label>
+      Viewer theme
+      <select [value]="theme()" (change)="theme.set($any($event.target).value)">
+        <option value="default">built-in dark</option>
+        <option value="light">light (CSS variables)</option>
+        <option value="brand">brand (::part + slots)</option>
+      </select>
+    </label>
+    <label class="file">
+      <input #file type="file" accept=".pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation" (change)="upload(file)" [disabled]="busy()">
+      <span>{{ busy() ? 'Converting...' : 'Choose a .pptx' }}</span>
+    </label>
+  </section>
+
+  @if (error()) {
+    <p class="error" role="alert">{{ error() }}</p>
+  }
+
+  @if (result(); as r) {
+    <section class="stats">
+      <div><b>{{ r.manifest.count }}</b> slides</div>
+      <div>PPTX <b>{{ kb(r.sizes.pptx) }}</b></div>
+      <div>PDF <b>{{ kb(r.sizes.pdf) }}</b></div>
+      <div>fragments <b>{{ kb(r.sizes.fragments) }}</b></div>
+      <div>converted in <b>{{ r.sizes.ms }} ms</b></div>
+    </section>
+
+    <section class="report" [class.clean]="r.report.clean">
+      <h2>Fidelity report</h2>
+      <pre>{{ r.report.text }}</pre>
+    </section>
+
+    <section class="viewer" [attr.data-theme]="theme()">
+      <slide-viewer
+        #viewer
+        [attr.manifest]="manifestUrl()"
+        show-warnings
+        view-threshold="1500"
+        (ready)="log('ready', $event)"
+        (slidechange)="log('slidechange', $event)"
+        (slideviewed)="log('slideviewed', $event)"
+        (completed)="log('completed', $event)">
+        @if (theme() === 'brand') {
+          <span slot="prev-icon">◀</span>
+          <span slot="next-icon">▶</span>
+          <span slot="bar-start" class="brand-tag">Training</span>
+        }
+      </slide-viewer>
+
+      <div class="side">
+        <h2>Search the course</h2>
+        <input type="search" placeholder="e.g. equipo" [value]="query()" (input)="query.set($any($event.target).value)">
+        <ul>
+          @for (s of hits(); track s.number) {
+            <li><button type="button" (click)="goTo(viewer, s.number)">Slide {{ s.number }} · {{ s.title || 'untitled' }}</button></li>
+          } @empty {
+            @if (query()) { <li class="muted">No slides match</li> }
+          }
+        </ul>
+
+        <h2>Rebuild from fragments</h2>
+        <input placeholder="range, e.g. 2-3 (empty = all)" [value]="range()" (input)="range.set($any($event.target).value)">
+        <a class="button" [href]="assembleUrl()">Download PDF</a>
+
+        <h2>Tracking events</h2>
+        <ol class="events">
+          @for (e of events(); track $index) { <li>{{ e }}</li> }
+        </ol>
+      </div>
+    </section>
+  }
+</main>

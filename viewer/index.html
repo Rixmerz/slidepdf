@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
+<title>Slides</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111316; color: #ddd; font: 14px system-ui, sans-serif; }
+  main { display: flex; flex-direction: column; height: 100%; padding: 16px; box-sizing: border-box; gap: 8px; }
+  slide-viewer { flex: 1; min-height: 0; }
+  #log { white-space: pre; font: 12px ui-monospace, monospace; color: #8a9099; max-height: 4.5em; overflow: auto; }
+</style>
+<script type="module" src="slide-viewer.js"></script>
+</head>
+<body>
+<main>
+  <slide-viewer id="v" manifest="manifest.json" show-warnings></slide-viewer>
+  <div id="log" aria-live="polite"></div>
+</main>
+<script>
+  // Tracking hooks: replace console/log with calls to your platform's API.
+  const log = document.getElementById("log");
+  const note = (msg) => { log.textContent = msg + "\n" + log.textContent; };
+  const v = document.getElementById("v");
+  v.addEventListener("slideviewed", (e) => note(`viewed slide ${e.detail.number} for ${(e.detail.ms / 1000).toFixed(1)} s`));
+  v.addEventListener("completed", (e) => note(`completed all ${e.detail.total} slides in ${(e.detail.ms / 1000).toFixed(0)} s`));
+  // Focus once upgraded so arrow keys work right away.
+  v.addEventListener("ready", () => v.focus());
+</script>
+</body>
+</html>

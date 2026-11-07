@@ -1,0 +1,68 @@
+name: Release
+
+# Publishes the npm package when a tag like v0.1.0 is pushed.
+# Needs the repository secret NPM_TOKEN (an npm "Automation" token).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write # npm provenance
+
+jobs:
+  npm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - run: cargo install wasm-bindgen-cli --version 0.2.130 --locked
+      - run: npm install --global binaryen
+      - run: scripts/build-npm.sh
+      - name: Check the tag matches package.json
+        run: test "v$(node -p "require('./npm/package.json').version")" = "${GITHUB_REF_NAME}"
+      - run: npm publish --provenance --access public
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl }
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: cargo install cross --locked
+      - name: Build
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == *musl ]]; then
+            cross build --release --target ${{ matrix.target }} --bin slidepdf
+          else
+            cargo build --release --target ${{ matrix.target }} --bin slidepdf
+          fi
+      - name: Package
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/slidepdf
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          tar czf slidepdf-${{ matrix.target }}.tar.gz -C "$(dirname "$bin")" "$(basename "$bin")"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: slidepdf-${{ matrix.target }}.tar.gz

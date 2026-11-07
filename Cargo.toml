@@ -1,0 +1,62 @@
+[package]
+name = "slidepdf"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-light PPTX to PDF converter with per-slide PDF fragments that can be stored, reassembled and viewed as slices"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Rixmerz/slidepdf"
+readme = "README.md"
+keywords = ["pptx", "pdf", "powerpoint", "converter", "slides"]
+categories = ["command-line-utilities", "encoding", "multimedia"]
+exclude = ["examples/", "npm/", "viewer/node_modules", ".github/"]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "slidepdf"
+path = "src/main.rs"
+
+[features]
+default = ["downsample", "assemble", "fonts"]
+# Embed TTF/OTF fonts as subsets.
+fonts = ["dep:ttf-parser", "dep:subsetter"]
+# Re-encode oversized images to the resolution they are actually shown at.
+downsample = ["dep:jpeg-decoder", "dep:jpeg-encoder"]
+# Reassemble and split arbitrary PDFs (needs a PDF parser).
+assemble = ["dep:lopdf"]
+ttf-parser = ["dep:ttf-parser"]
+subsetter = ["dep:subsetter"]
+
+[dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+pdf-writer = "0.15"
+miniz_oxide = "0.8"
+png = "0.17"
+jpeg-decoder = { version = "0.3", optional = true, default-features = false }
+jpeg-encoder = { version = "0.6", optional = true }
+lopdf = { version = "0.38", optional = true, default-features = false }
+ttf-parser = { version = "0.25", optional = true }
+subsetter = { version = "0.2", optional = true }
+gif = { version = "0.14", default-features = false, features = ["std"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# WebAssembly: size first ("s" is both smaller gzipped and faster than "z").
+# wasm-bindgen needs the custom sections, so nothing is stripped here.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+strip = false
+
+[workspace]
+members = [".", "bindings/wasm"]
+
+[dev-dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }

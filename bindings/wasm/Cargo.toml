@@ -1,0 +1,24 @@
+[package]
+name = "slidepdf-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "WebAssembly bindings for slidepdf"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[features]
+default = ["assemble", "fonts"]
+# Reassembling and splitting PDFs (adds ~160 KB gzipped).
+assemble = ["slidepdf/assemble", "dep:lopdf"]
+# Embedding TTF/OTF fonts (adds ~165 KB gzipped).
+fonts = ["slidepdf/fonts"]
+
+[dependencies]
+slidepdf = { path = "../..", default-features = false, features = ["downsample"] }
+wasm-bindgen = "=0.2.130"
+js-sys = "0.3"
+# lopdf pulls getrandom (for encryption); on wasm it needs the JS backend.
+lopdf = { version = "0.38", default-features = false, features = ["wasm_js"], optional = true }
