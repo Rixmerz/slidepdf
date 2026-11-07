@@ -6,6 +6,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-07
+
+Fidelity and size release: decks made of photos and brand fonts come out
+smaller and closer to PowerPoint, and the report says what it could not keep.
+
+### Changed
+
+- A PNG that holds a photo (many distinct colours) is stored as JPEG at the
+  preset's quality when that halves it or better; its transparency stays a
+  lossless soft mask, with transparent pixels filled from their visible
+  neighbours so no fringe shows. Logos, diagrams and screenshots stay
+  lossless. An 81 MB deck of photos went from 45 MB to 5.9 MB, another from
+  5.8 MB to 515 KB, and conversion got faster (less to compress).
+- The weight named in a typeface ("Montserrat Black", "Segoe UI Semibold")
+  is used: the run takes the registered font of the nearest weight (same
+  slant first), or the bold base-14 font from SemiBold up when none is
+  registered. These runs were drawn regular before.
+- `FontFile.data` is an `Arc<[u8]>` (Rust API): a conversion no longer
+  copies every registered font, and a variable font's instances share it.
+
+### Added
+
+- Variable fonts: a font with a `wght` axis is embedded at the weight each
+  run asks for (one subset per weight used). Their default outlines, often
+  the Thin master, were drawn before.
+- The report lists every typeface drawn with a base-14 font instead (other
+  than Arial, Helvetica, Times, Courier and Calibri), once per deck, so a
+  deck whose brand font is missing is no longer reported clean.
+- Viewer: `requestInit` (fetch options such as an `Authorization` header,
+  also passed to pdf.js), `loader(url, kind)` to fetch every file yourself,
+  `pdfjsLib` to use a pdf.js 3.x or 4.x module the page already loads, and
+  texts in Spanish (`lang="es"` on the element or an ancestor) or your own
+  (`labels`). Types for the element in `index.d.ts`.
+
+### Fixed
+
+- `npm test` runs on Node 22 and 24 again (the directory argument broke it).
+
 ## [0.3.0] - 2026-11-07
 
 Scalability release: everything a converter needs to run predictably inside
