@@ -698,7 +698,7 @@ impl<'d> Renderer<'d> {
             let w = Warning {
                 slide: None,
                 message: format!(
-                    "font '{face}' is not available and was drawn with {base}; line breaks may differ (register the font file to embed it)"
+                    "font '{face}' is not available and was drawn with {base}; line breaks may differ (to embed it, register the font file with a preset other than light)"
                 ),
             };
             if !self.warnings.contains(&w) {
