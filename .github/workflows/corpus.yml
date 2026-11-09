@@ -1,0 +1,28 @@
+name: Corpus
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  SLIDEPDF_CORPUS: ${{ github.workspace }}/corpus
+
+jobs:
+  corpus:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: corpus
+          key: corpus-${{ hashFiles('scripts/corpus.sh') }}
+      - run: scripts/corpus.sh "$SLIDEPDF_CORPUS"
+      - run: cargo test --release --test corpus -- --ignored

@@ -62,8 +62,13 @@ Without registered fonts, text is drawn in Helvetica / Times / Courier
 (matched by the deck's typeface), which covers Spanish and Western European
 text. Register a TTF/OTF with `--font` to use the real typeface (matched by
 family name) and to cover characters outside WinAnsi (Greek, arrows...). Only
-the glyphs used are embedded. Characters that no font can draw become `?` and
-are listed in the report.
+the glyphs used are embedded. A character outside WinAnsi is drawn with any
+registered font that has the glyph when the run's own typeface is not
+registered or lacks it (same slant first, then the nearest weight, then
+registration order), so registering one broad font such as Noto Sans gives
+Greek and Cyrillic to every typeface, while Latin text keeps using the base-14
+fonts. Characters that no font can draw become `?` and are listed in the
+report.
 
 Weights written in the typeface ("Montserrat Black", "Segoe UI Semibold")
 count: the run takes the registered file of the nearest weight, or the bold
@@ -328,7 +333,7 @@ with a fallback picture (equations, some icons). Hidden shapes are skipped.
 Not supported yet (reported per slide): radar, bubble, stock and surface
 charts (drawn as line charts), SmartArt saved without its
 drawing, SVG and TIFF images, built-in Office table styles that the deck
-does not define (a default look is used), rotated groups, shadows
+does not define (a default look is used), shadows
 and effects, animations and transitions. Text layout is close to PowerPoint
 but not identical, since fonts differ unless the real ones are registered.
 
@@ -339,8 +344,26 @@ but not identical, since fonts differ unless the real ones are registered.
 - `src/fragments.rs`: manifest, assemble, split
 - `bindings/wasm`, `npm/`: WebAssembly bindings and the npm package
 - `tests/`: robustness tests (corrupt, truncated and hostile inputs) and fixture
-- `scripts/`: npm build and benchmarks
+- `scripts/`: npm build, benchmarks and the corpus fetcher
 - `viewer/`: `<slide-viewer>` and the static `index.html`
+
+## Real-deck corpus test
+
+CI converts about 540 real decks (the LibreOffice `sd/qa/unit/data` and Apache
+POI `test-data/slideshow` test files) on every pull request and compares each
+result with `tests/corpus-baseline.json`. To run it locally, fetch the corpus
+once (about 180 MB) and point the ignored test at it:
+
+```sh
+scripts/corpus.sh /tmp/corpus
+SLIDEPDF_CORPUS=/tmp/corpus cargo test --release --test corpus -- --ignored
+```
+
+A deck that panics, exceeds the time cap or the 256 MB memory budget, or whose
+slide count disagrees with `inspect`, fails the test. Any other difference
+from the baseline fails it too and is printed as decks that got better or
+worse. If the change is intended, refresh the baseline with
+`SLIDEPDF_CORPUS_UPDATE=1` on the same command and commit the file.
 
 ## License
 

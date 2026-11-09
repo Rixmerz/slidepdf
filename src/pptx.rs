@@ -1510,10 +1510,11 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
                 self.theme.line_widths.get(i).copied().unwrap_or(9525.0)
             });
             if let Some(color) = color {
-                stroke = Some(Stroke {
-                    color,
-                    width: width * xf.sx.min(xf.sy),
-                });
+                // Line widths are absolute: PowerPoint keeps them when a
+                // group is resized, and legacy groups (child space in old
+                // master units, scale in the hundreds) would otherwise turn
+                // into blobs.
+                stroke = Some(Stroke { color, width });
             }
         }
 

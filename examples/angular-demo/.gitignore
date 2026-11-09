@@ -43,3 +43,6 @@ __screenshots__/
 .DS_Store
 Thumbs.db
 store/
+
+# Deck folders written by the demo API
+/store

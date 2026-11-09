@@ -366,12 +366,16 @@ fn png_image(bytes: &[u8], t: Target) -> Result<Prepared, String> {
 fn photo_as_jpeg(px: &[u8], w: u32, h: u32, space: ColorSpace, flate_len: usize, quality: u8) -> Option<Vec<u8>> {
     // Below this the lossless stream is already cheap.
     const MIN_FLATE: usize = 48 * 1024;
-    // Flat graphics (even anti-aliased text) stay well under this.
-    const PHOTO_COLORS: usize = 8192;
+    // Flat graphics (even anti-aliased text) stay well under this. A
+    // greyscale image has only 256 values, so it gets a threshold of its own.
+    let photo_colors: usize = match space {
+        ColorSpace::Gray => 200,
+        _ => 8192,
+    };
     if flate_len < MIN_FLATE || w > u16::MAX as u32 || h > u16::MAX as u32 {
         return None;
     }
-    if distinct_colors(px, space.comps(), PHOTO_COLORS) < PHOTO_COLORS {
+    if distinct_colors(px, space.comps(), photo_colors) < photo_colors {
         return None;
     }
     let jpeg = encode_jpeg(px, w, h, space, quality).ok()?;
@@ -742,6 +746,26 @@ mod tests {
         assert!(p.dct, "an opaque photo should be stored as JPEG");
         assert!(p.data.len() * 2 < png.len());
         assert!(p.smask.is_none());
+    }
+
+    #[cfg(feature = "downsample")]
+    #[test]
+    fn greyscale_photo_becomes_jpeg() {
+        let px: Vec<u8> = photo(600, 400, false).iter().step_by(3).copied().collect();
+        let png = encode_png(&px, 600, 400, png::ColorType::Grayscale);
+        let p = prepare(&png, KEEP).unwrap();
+        assert!(p.dct, "a greyscale photo should be stored as JPEG");
+        assert!(p.data.len() * 2 < png.len());
+    }
+
+    #[test]
+    fn flat_greyscale_graphics_stay_lossless() {
+        let (w, h) = (600u32, 400u32);
+        let px: Vec<u8> = (0..w * h)
+            .map(|i| [30, 128, 230][((i % w / 50 + i / w / 40) % 3) as usize])
+            .collect();
+        let p = prepare(&encode_png(&px, w, h, png::ColorType::Grayscale), KEEP).unwrap();
+        assert!(!p.dct);
     }
 
     #[cfg(feature = "downsample")]
