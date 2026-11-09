@@ -728,22 +728,34 @@ impl Xform {
     /// rotation; it never shears a rotated child. A mirrored group (exactly
     /// one flip) also reverses the sense of the child's rotation.
     fn place(&self, r: Rect, rotation: f32, flip_h: bool, flip_v: bool) -> Placed {
+        self.turn(self.rect(r), rotation, flip_h, flip_v)
+    }
+
+    /// The rect a child occupies once the group scales and moves it, before
+    /// any turning. Shapes made of many pieces (tables, charts, metafiles) are
+    /// built here and then turned with `turn_since`.
+    fn rect(&self, r: Rect) -> Rect {
+        Rect {
+            x: r.x * self.sx + self.tx,
+            y: r.y * self.sy + self.ty,
+            w: r.w * self.sx,
+            h: r.h * self.sy,
+        }
+    }
+
+    /// Applies the group's flips and rotation, around its centre, to a shape
+    /// already placed on the slide by `rect`.
+    fn turn(&self, r: Rect, rotation: f32, flip_h: bool, flip_v: bool) -> Placed {
         if self.is_plain() {
             return Placed {
-                rect: Rect {
-                    x: r.x * self.sx + self.tx,
-                    y: r.y * self.sy + self.ty,
-                    w: r.w * self.sx,
-                    h: r.h * self.sy,
-                },
+                rect: r,
                 rotation,
                 flip_h,
                 flip_v,
             };
         }
-        let (w, h) = (r.w * self.sx, r.h * self.sy);
-        let mut dx = (r.x + r.w / 2.0) * self.sx + self.tx - self.pivot.0;
-        let mut dy = (r.y + r.h / 2.0) * self.sy + self.ty - self.pivot.1;
+        let mut dx = r.x + r.w / 2.0 - self.pivot.0;
+        let mut dy = r.y + r.h / 2.0 - self.pivot.1;
         if self.flip_h {
             dx = -dx;
         }
@@ -757,10 +769,10 @@ impl Xform {
         let turned = if mirrored { self.rot - rotation } else { self.rot + rotation };
         Placed {
             rect: Rect {
-                x: cx - w / 2.0,
-                y: cy - h / 2.0,
-                w,
-                h,
+                x: cx - r.w / 2.0,
+                y: cy - r.h / 2.0,
+                w: r.w,
+                h: r.h,
             },
             rotation: turned.rem_euclid(360.0),
             flip_h: self.flip_h != flip_h,
@@ -768,10 +780,30 @@ impl Xform {
         }
     }
 
-    /// The rect of a shape that cannot turn (tables, charts): its centre is
-    /// carried along, its sides stay horizontal and vertical.
-    fn rect(&self, r: Rect) -> Rect {
-        self.place(r, 0.0, false, false).rect
+    /// Turns every element in `elements` like a child of this group. The
+    /// elements must already sit at their slide position (see `rect`).
+    fn turn_elements(&self, elements: &mut [Element]) {
+        if self.is_plain() {
+            return;
+        }
+        for e in elements {
+            match e {
+                Element::Shape(s) => {
+                    let p = self.turn(s.rect, s.rotation, s.flip_h, s.flip_v);
+                    // The text box keeps its offset from the shape's centre.
+                    s.text_rect = s.text_rect.map(|t| Rect {
+                        x: t.x + p.rect.x - s.rect.x,
+                        y: t.y + p.rect.y - s.rect.y,
+                        ..t
+                    });
+                    (s.rect, s.rotation, s.flip_h, s.flip_v) = (p.rect, p.rotation, p.flip_h, p.flip_v);
+                }
+                Element::Picture(pic) => {
+                    let p = self.turn(pic.rect, pic.rotation, pic.flip_h, pic.flip_v);
+                    (pic.rect, pic.rotation, pic.flip_h, pic.flip_v) = (p.rect, p.rotation, p.flip_h, p.flip_v);
+                }
+            }
+        }
     }
 
     /// The child space of a nested group with the given `xfrm` values.
@@ -1392,10 +1424,10 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         let Some(rid) = n.path(&["blipFill", "blip"]).and_then(|b| b.attr("embed")) else {
             return;
         };
-        let placed = xf.place(x.rect, x.rot, x.flip_h, x.flip_v);
-        if self.metafile(part, rid, placed.rect) {
+        if self.metafile(part, rid, x.rect, xf) {
             return;
         }
+        let placed = xf.place(x.rect, x.rot, x.flip_h, x.flip_v);
         let Some(media) = self.media(part, rid) else { return };
         let crop = n
             .path(&["blipFill", "srcRect"])
@@ -2036,7 +2068,9 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         let uri = data.attr("uri").unwrap_or("");
         if let Some(tbl) = data.child("tbl") {
             let Some(x) = n.child("xfrm").and_then(parse_xfrm) else { return };
+            let first = self.elements.len();
             self.table(tbl, part, xf.rect(x.rect));
+            xf.turn_elements(&mut self.elements[first..]);
         } else if uri.ends_with("/ole") {
             // Embedded documents (Excel, Word, think-cell...) carry a preview
             // picture; draw it in the frame.
@@ -2044,10 +2078,10 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             let rid = pic.and_then(|p| p.path(&["blipFill", "blip"])).and_then(|b| b.attr("embed"));
             match (rid, n.child("xfrm").and_then(parse_xfrm)) {
                 (Some(rid), Some(x)) => {
-                    let placed = xf.place(x.rect, x.rot, false, false);
-                    if self.metafile(part, rid, placed.rect) {
+                    if self.metafile(part, rid, x.rect, xf) {
                         return;
                     }
+                    let placed = xf.place(x.rect, x.rot, false, false);
                     if let Some(media) = self.media(part, rid) {
                         self.elements.push(Element::Picture(Picture {
                             rect: placed.rect,
@@ -2063,7 +2097,10 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             }
         } else if uri.ends_with("/chart") {
             let Some(x) = n.child("xfrm").and_then(parse_xfrm) else { return };
-            if !self.chart(data, part, xf.rect(x.rect)) {
+            let first = self.elements.len();
+            if self.chart(data, part, xf.rect(x.rect)) {
+                xf.turn_elements(&mut self.elements[first..]);
+            } else {
                 self.warn("chart skipped (no cached data)");
             }
         } else if uri.ends_with("/diagram") {
@@ -2077,8 +2114,9 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
     }
 
     /// EMF/WMF pictures are replayed into vector shapes. Returns true when
-    /// `rid` is a metafile (drawn, or skipped with a warning).
-    fn metafile(&mut self, part: &Part, rid: &str, rect: Rect) -> bool {
+    /// `rid` is a metafile (drawn, or skipped with a warning). `frame` is the
+    /// picture's rect in the child space of `xf`.
+    fn metafile(&mut self, part: &Part, rid: &str, frame: Rect, xf: Xform) -> bool {
         let Some(target) = part.rels.get(rid).map(|r| r.target.clone()) else {
             return false;
         };
@@ -2090,7 +2128,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             self.warn(format!("{target}: missing or too large, skipped"));
             return true;
         };
-        match crate::metafile::render(&bytes, rect) {
+        match crate::metafile::render(&bytes, xf.rect(frame)) {
             Ok((elements, bitmaps)) => {
                 if elements.is_empty() {
                     self.warn(format!(
@@ -2108,6 +2146,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
                     used += png.len();
                     self.embedded.insert(format!("{target}#bitmap{i}"), png);
                 }
+                let first = self.elements.len();
                 for mut e in elements {
                     if let Element::Picture(p) = &mut e {
                         p.media = format!("{target}{}", p.media);
@@ -2118,6 +2157,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
                     }
                     self.elements.push(e);
                 }
+                xf.turn_elements(&mut self.elements[first..]);
             }
             Err(e) => self.warn(format!("{target}: {e}, skipped")),
         }
@@ -2680,5 +2720,65 @@ mod tests {
         let t = g.text_rect(shape, at, rect(100.0, 100.0, 800.0, 800.0));
         assert!(close(t.x + t.w / 2.0, at.x + at.w / 2.0));
         assert!(close(t.w, 800.0) && close(t.h, 800.0));
+    }
+
+    fn piece(r: Rect, rotation: f32, flip_h: bool) -> Element {
+        Element::Shape(Shape {
+            rect: r,
+            rotation,
+            flip_h,
+            flip_v: false,
+            geometry: Geometry::Rect,
+            fill: None,
+            stroke: None,
+            text: None,
+            is_title: false,
+            text_rect: Some(rect(r.x + 10.0, r.y + 10.0, r.w - 20.0, r.h - 20.0)),
+        })
+    }
+
+    #[test]
+    fn pieces_of_a_table_or_chart_turn_like_a_child_shape() {
+        // A frame of several pieces (table cells, chart bars) is built at its
+        // scaled position and then turned; each piece must land exactly where
+        // a plain child with the same rect would.
+        let g = group(
+            &Xform::ID,
+            r#"rot="5400000" flipH="1""#,
+            (1000, 1000),
+            (2000, 1000),
+            (0, 0, 1000, 500),
+        );
+        let child = rect(100.0, 50.0, 300.0, 100.0);
+        let mut pieces = [piece(g.rect(child), 30.0, true)];
+        g.turn_elements(&mut pieces);
+        let Element::Shape(s) = &pieces[0] else { panic!("not a shape") };
+        let want = g.place(child, 30.0, true, false);
+        assert_placed(
+            Placed {
+                rect: s.rect,
+                rotation: s.rotation,
+                flip_h: s.flip_h,
+                flip_v: s.flip_v,
+            },
+            [want.rect.x, want.rect.y, want.rect.w, want.rect.h],
+            want.rotation,
+            (want.flip_h, want.flip_v),
+        );
+        // The text box moved with its shape.
+        let t = s.text_rect.unwrap();
+        assert!(close(t.x - s.rect.x, 10.0) && close(t.y - s.rect.y, 10.0));
+        // Guard against a no-op: the piece really did move and turn.
+        assert!(!close(s.rect.x, g.rect(child).x) && s.rotation != 30.0);
+    }
+
+    #[test]
+    fn pieces_inside_a_plain_group_stay_put() {
+        let g = group(&Xform::ID, "", (1000, 1000), (2000, 1000), (0, 0, 1000, 500));
+        let r = g.rect(rect(100.0, 50.0, 300.0, 100.0));
+        let mut pieces = [piece(r, 0.0, false)];
+        g.turn_elements(&mut pieces);
+        let Element::Shape(s) = &pieces[0] else { panic!("not a shape") };
+        assert_eq!((s.rect.x, s.rect.y, s.rotation), (r.x, r.y, 0.0));
     }
 }
