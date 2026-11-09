@@ -333,7 +333,7 @@ with a fallback picture (equations, some icons). Hidden shapes are skipped.
 Not supported yet (reported per slide): radar, bubble, stock and surface
 charts (drawn as line charts), SmartArt saved without its
 drawing, SVG and TIFF images, built-in Office table styles that the deck
-does not define (a default look is used), rotated groups, shadows
+does not define (a default look is used), shadows
 and effects, animations and transitions. Text layout is close to PowerPoint
 but not identical, since fonts differ unless the real ones are registered.
 
