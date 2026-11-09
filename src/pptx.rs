@@ -10,6 +10,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::io::{Cursor, Read, Seek};
 
 use crate::ir::*;
+use crate::presets;
 use crate::xml::{self, Node};
 
 // ---------------------------------------------------------------- package
@@ -1558,16 +1559,18 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             return Geometry::Rect;
         };
         let prst = pg.attr("prst").unwrap_or("rect");
-        let adj = |name: &str, def: f32| {
+        // An adjust value in the file's own units (fractions are 100000ths,
+        // angles 60000ths of a degree).
+        let raw = |name: &str, def: f32| {
             pg.path(&["avLst"])
                 .and_then(|a| a.children.iter().find(|g| g.attr("name") == Some(name)))
                 .and_then(|g| g.attr("fmla"))
                 .and_then(|f| f.strip_prefix("val "))
                 .and_then(|v| v.trim().parse::<f32>().ok())
-                .filter(|v| v.is_finite() && v.abs() < 1.0e7)
+                .filter(|v| v.is_finite() && v.abs() <= 2_147_483_647.0)
                 .unwrap_or(def)
-                / 100000.0
         };
+        let adj = |name: &str, def: f32| raw(name, def) / 100000.0;
         let ss = r.w.min(r.h);
         let (fx, fy) = if r.w > 0.0 && r.h > 0.0 { (ss / r.w, ss / r.h) } else { (0.0, 0.0) };
         let poly = |pts: &[(f32, f32)]| {
@@ -1580,10 +1583,11 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             Geometry::Path(v)
         };
         match prst {
-            "rect" | "flowChartProcess" | "snip1Rect" => Geometry::Rect,
+            "rect" | "flowChartProcess" => Geometry::Rect,
             "roundRect" | "flowChartAlternateProcess" => Geometry::RoundRect(adj("adj", 16667.0)),
             "ellipse" | "flowChartConnector" => Geometry::Ellipse,
-            "line" | "straightConnector1" | "bentConnector2" | "bentConnector3" | "curvedConnector3" => Geometry::Line,
+            "line" | "straightConnector1" | "bentConnector2" | "bentConnector3" | "bentConnector4" | "bentConnector5"
+            | "curvedConnector2" | "curvedConnector3" | "curvedConnector4" | "curvedConnector5" => Geometry::Line,
             "triangle" => {
                 let a = adj("adj", 50000.0);
                 poly(&[(a, 0.0), (1.0, 1.0), (0.0, 1.0)])
@@ -1715,9 +1719,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             | "flowChartPunchedTape"
             | "flowChartDocument"
             | "wave" => Geometry::RoundRect(0.12),
-            "teardrop" | "sun" | "smileyFace" | "noSmoking" | "donut" | "blockArc" | "flowChartOr" | "flowChartSummingJunction" => {
-                Geometry::Ellipse
-            }
+            "teardrop" | "sun" | "smileyFace" | "noSmoking" | "donut" | "flowChartOr" | "flowChartSummingJunction" => Geometry::Ellipse,
             "wedgeRectCallout" | "wedgeRoundRectCallout" | "wedgeEllipseCallout" => {
                 // Tail tip relative to the center, in fractions of the box.
                 let tip = (0.5 + adj("adj1", -20833.0), 0.5 + adj("adj2", 62500.0));
@@ -1852,13 +1854,14 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
                     ]
                 })
             }
-            "actionButtonBlank" | "flowChartAlternateProcess2" | "snip2SameRect" | "snipRoundRect" | "foldedCorner" | "bevel" => {
-                Geometry::Rect
-            }
-            other => {
-                self.warn(format!("preset shape '{other}' drawn as a rectangle"));
-                Geometry::Rect
-            }
+            "actionButtonBlank" | "flowChartAlternateProcess2" => Geometry::Rect,
+            other => match presets::outline(other, &raw, r) {
+                Some(g) => g,
+                None => {
+                    self.warn(format!("preset shape '{other}' drawn as a rectangle"));
+                    Geometry::Rect
+                }
+            },
         }
     }
 

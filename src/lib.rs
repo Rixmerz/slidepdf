@@ -26,6 +26,7 @@ mod metafile;
 mod metrics;
 pub mod pdf;
 pub mod pptx;
+mod presets;
 mod xml;
 
 pub use fonts::FontFile;
