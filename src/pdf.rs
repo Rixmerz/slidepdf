@@ -117,15 +117,22 @@ impl Fonts<'_, '_> {
         }
         let (family, _, named_italic) = face_style(&r.face);
         let full = r.face.to_lowercase();
-        let weight = run_weight(&r.face, r.bold) as i32;
-        let italic = r.italic || named_italic;
         (0..self.files.len())
             .filter(|&i| self.files[i].family == family || self.files[i].family == full)
-            .min_by_key(|&i| {
-                let f = &self.files[i];
-                let lighter = (f.weight as i32) < weight;
-                (f.italic != italic, (f.weight as i32 - weight).abs(), lighter == (weight >= 400))
-            })
+            .min_by_key(|&i| self.rank(r, i, named_italic))
+    }
+
+    /// Sort key of registered file `i` for a run: same slant first, then
+    /// the nearest weight, then the CSS tie-break.
+    fn rank(&self, r: &Run, i: usize, named_italic: bool) -> (bool, i32, bool) {
+        let weight = run_weight(&r.face, r.bold) as i32;
+        let f = &self.files[i];
+        let lighter = (f.weight as i32) < weight;
+        (
+            f.italic != (r.italic || named_italic),
+            (f.weight as i32 - weight).abs(),
+            lighter == (weight >= 400),
+        )
     }
 
     fn note_substitution(&mut self, r: &Run, key: FontKey) {
@@ -177,7 +184,12 @@ impl Fonts<'_, '_> {
                 run,
             };
         }
-        for i in 0..self.files.len() {
+        // Any registered font with the glyph, nearest in slant and weight
+        // first, then in registration order (the sort is stable).
+        let named_italic = face_style(&r.face).2;
+        let mut order: Vec<usize> = (0..self.files.len()).collect();
+        order.sort_by_key(|&i| self.rank(r, i, named_italic));
+        for i in order {
             if let Some(g) = emb(self, i) {
                 return g;
             }
@@ -1672,6 +1684,35 @@ mod tests {
         };
         fonts.glyph(&run("Montserrat", false, false), 0, '→');
         assert!(fonts.substituted.is_empty());
+    }
+
+    #[cfg(feature = "fonts")]
+    #[test]
+    fn characters_outside_winansi_fall_back_to_any_registered_font() {
+        let greek = FontFile::parse(include_bytes!("../tests/fixtures/greek-static.ttf").to_vec()).unwrap();
+        // Registered under another family, first as an italic, then upright.
+        let mut italic = greek.clone();
+        italic.italic = true;
+        let files = [italic, greek];
+        let mut usage = [Usage::default(), Usage::default()];
+        let mut fonts = Fonts {
+            files: &files,
+            usage: &mut usage,
+            missing: Vec::new(),
+            substituted: Vec::new(),
+        };
+        // Greek in an unregistered typeface: the upright file wins over the
+        // earlier italic one.
+        let g = fonts.glyph(&run("Montserrat", false, false), 0, 'α');
+        assert!(matches!(g.font, FontId::Emb(1)), "upright run takes the upright file");
+        let g = fonts.glyph(&run("Montserrat", false, true), 0, 'β');
+        assert!(matches!(g.font, FontId::Emb(0)), "italic run takes the italic file");
+        // Latin in an unregistered typeface stays on the base-14 fonts.
+        let g = fonts.glyph(&run("Montserrat", false, false), 0, 'a');
+        assert!(matches!(g.font, FontId::Base(_)));
+        // A character no registered font has is still reported.
+        fonts.glyph(&run("Montserrat", false, false), 0, '→');
+        assert_eq!(fonts.missing, vec!['→']);
     }
 
     #[test]

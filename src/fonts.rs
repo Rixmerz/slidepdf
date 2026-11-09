@@ -111,24 +111,32 @@ impl FontFile {
     /// The faces this file provides: itself for a static font; for a
     /// variable font, one instance per standard weight (100, 200 ... 900)
     /// its `wght` axis covers. Instances share the file's bytes, and only
-    /// the ones a deck uses are embedded.
+    /// the ones a deck uses are embedded. A range holding no standard weight
+    /// (say 410..490) yields one instance at the axis default.
     pub fn instances(&self) -> Vec<FontFile> {
         let Some((min, max)) = self.weight_axis.filter(|_| self.instance.is_none()) else {
             return vec![self.clone()];
         };
         let stem = self.postscript_name.split('-').next().unwrap_or(&self.postscript_name).to_string();
         let slant = if self.italic { "Italic" } else { "" };
-        (1..=9u16)
+        let make = |w: u16, at: f32| FontFile {
+            postscript_name: format!("{stem}-{}{slant}", weight_name(w)),
+            bold: w >= 600,
+            weight: w,
+            instance: Some(at),
+            ..self.clone()
+        };
+        let standard: Vec<FontFile> = (1..=9u16)
             .map(|i| i * 100)
             .filter(|&w| (min..=max).contains(&(w as f32)))
-            .map(|w| FontFile {
-                postscript_name: format!("{stem}-{}{slant}", weight_name(w)),
-                bold: w >= 600,
-                weight: w,
-                instance: Some(w as f32),
-                ..self.clone()
-            })
-            .collect()
+            .map(|w| make(w, w as f32))
+            .collect();
+        if !standard.is_empty() {
+            return standard;
+        }
+        // `weight` is the axis default; keep it inside the range the axis allows.
+        let at = (self.weight as f32).clamp(min, max);
+        vec![make(self.weight, at)]
     }
 }
 
@@ -298,6 +306,32 @@ mod tests {
         // A lone word is a family, never a weight.
         assert_eq!(face_style("Black"), ("black".into(), None, false));
         assert_eq!(face_style("Times New Roman"), ("times new roman".into(), None, false));
+    }
+
+    #[test]
+    fn a_variable_font_without_a_standard_weight_keeps_one_instance() {
+        let font = |axis, weight| FontFile {
+            data: Arc::from(Vec::new()),
+            family: "narrow".into(),
+            postscript_name: "Narrow-Regular".into(),
+            bold: false,
+            italic: false,
+            weight,
+            weight_axis: Some(axis),
+            instance: None,
+            units_per_em: 1000.0,
+            ascent: 0.0,
+            descent: 0.0,
+            cap_height: 0.0,
+            italic_angle: 0.0,
+            bbox: [0.0; 4],
+        };
+        let one = font((410.0, 490.0), 450).instances();
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].weight, one[0].instance), (450, Some(450.0)));
+        // A range with standard weights is unchanged: 300, 400, 500.
+        let weights: Vec<u16> = font((300.0, 500.0), 400).instances().iter().map(|f| f.weight).collect();
+        assert_eq!(weights, vec![300, 400, 500]);
     }
 
     #[test]
