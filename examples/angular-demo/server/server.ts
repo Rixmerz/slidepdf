@@ -2,7 +2,7 @@
 // fragments on disk, the way a CDN bucket would hold them.
 //
 //   POST /api/convert?preset=light|balanced|print   body: raw PPTX bytes
-//        -> { id, manifest, report, sizes }
+//        -> { id, manifest, report, sizes }, with X-Slidepdf-Cache: hit | miss | joined
 //   GET  /api/decks/:id/assemble?range=2-4          -> application/pdf
 //   GET  /store/:id/<file>                          -> stored fragment / manifest
 //   GET  /metrics                                   -> Prometheus text format
@@ -10,13 +10,14 @@
 // Run with: node server/server.ts   (Node 23+ strips the types natively)
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdir, readFile, rm, stat } from "node:fs/promises";
-import { createReadStream, createWriteStream } from "node:fs";
+import { copyFile, mkdir, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { constants, createReadStream, createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import { join, normalize } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { createJobs, createResultCache, dirBytes, type Lease } from "./dedupe.ts";
 import { createMetrics, outcomeOfCode, type Outcome } from "./metrics.ts";
 import { createPool, verifyFragment, SlidepdfError, type Preset, type Manifest } from "slidepdf";
 
@@ -27,6 +28,8 @@ const MAX_UPLOAD = MAX_UPLOAD_MB * 1024 * 1024;
 // Decks with more slides than this are refused up front, before taking a worker.
 const MAX_SLIDES = Number(process.env.MAX_SLIDES ?? 500);
 const RECYCLE_MB = 64;
+const CACHE_HEADER = "x-slidepdf-cache";
+const PRESETS: Preset[] = ["light", "balanced", "print"];
 
 // Conversions run in worker threads with a hard budget each, so a bad deck
 // fails on its own and the process memory stays at roughly
@@ -40,23 +43,43 @@ const pool = createPool({
 
 const metrics = createMetrics(RECYCLE_MB);
 
+// Finished conversions, keyed by the SHA-256 of the deck and the preset. One server per CACHE_DIR.
+const cache = await createResultCache(
+  process.env.CACHE_DIR ?? join(tmpdir(), "slidepdf-demo-cache"),
+  Number(process.env.CACHE_MB ?? 256) * 1024 * 1024,
+);
+
+/** What a finished job leaves behind: a cache entry pinned once per attached request. */
+interface Staged {
+  staging: string;
+  bytes: number;
+  ms: number;
+}
+interface Done {
+  lease: Lease;
+  ms: number;
+}
+const jobs = createJobs<Staged, Done>();
+
 /** Maps a conversion failure to its outcome label. */
 function outcomeOf(e: unknown): Outcome {
   if (e instanceof HttpError) return "invalid";
   return e instanceof SlidepdfError ? outcomeOfCode(e.code) : "error";
 }
 
-/** Streams the upload to disk so a large deck never sits in memory. */
-async function saveUpload(req: IncomingMessage, dest: string): Promise<number> {
+/** Streams the upload to disk, hashing it on the way, so a large deck never sits in memory. */
+async function saveUpload(req: IncomingMessage, dest: string): Promise<{ size: number; sha256: string }> {
   let size = 0;
+  const hash = createHash("sha256");
   const limit = new Transform({
     transform(chunk: Buffer, _enc, done) {
       size += chunk.length;
+      hash.update(chunk);
       done(size > MAX_UPLOAD ? new HttpError(413, `file is larger than ${MAX_UPLOAD_MB} MB`) : null, chunk);
     },
   });
   await pipeline(req, limit, createWriteStream(dest));
-  return size;
+  return { size, sha256: hash.digest("hex") };
 }
 
 class HttpError extends Error {
@@ -67,11 +90,76 @@ class HttpError extends Error {
   }
 }
 
-/** A client that goes away cancels its conversion after the current slide. */
-function abortOnClose(req: IncomingMessage): AbortSignal {
-  const ac = new AbortController();
-  req.once("close", () => ac.abort());
-  return ac.signal;
+/** The preset is part of a file name in the cache, so only the known ones get through. */
+function parsePreset(value: string | null): Preset {
+  const preset = (value ?? "balanced") as Preset;
+  if (!PRESETS.includes(preset)) throw new HttpError(400, `preset must be one of ${PRESETS.join(", ")}`);
+  return preset;
+}
+
+/** Each failure code maps to a status the client can act on. */
+function toHttpError(e: unknown): HttpError {
+  if (e instanceof HttpError) return e;
+  const err = e as SlidepdfError;
+  const status = { memory: 413, timeout: 408, aborted: 499, convert: 422 }[err.code] ?? 500;
+  return new HttpError(status, `could not convert (${err.code}): ${err.message}`);
+}
+
+/**
+ * Converts the uploaded deck into a staging folder. The job owns `upload` and
+ * deletes it, whichever request started it, so it survives that request leaving.
+ */
+async function convertJob(upload: string, preset: Preset, name: string, started: number, signal: AbortSignal): Promise<Staged> {
+  const staging = join(cache.tmpDir, `job-${randomUUID()}`);
+  try {
+    await mkdir(staging);
+    // Preflight in milliseconds: refuse oversized decks before converting.
+    const info = await pool.inspectFile(upload, { signal });
+    if (info.slides > MAX_SLIDES) throw new HttpError(413, `deck has ${info.slides} slides, more than the ${MAX_SLIDES} allowed`);
+    // Bounded memory: reads the deck from disk and writes each output as it is produced.
+    const out = await pool.convertFile(upload, staging, { preset, sourceName: name, signal });
+    const bytes = await dirBytes(staging);
+    metrics.record("ok", (performance.now() - started) / 1000, out.stats.peakBytes);
+    metrics.converted(out.stats.slides, out.stats.inputBytes);
+    return { staging, bytes, ms: Math.round(out.stats.ms) };
+  } catch (e) {
+    await rm(staging, { recursive: true, force: true });
+    metrics.record(outcomeOf(e), (performance.now() - started) / 1000, e instanceof SlidepdfError ? e.peakBytes : undefined);
+    throw e;
+  } finally {
+    await rm(upload, { force: true });
+  }
+}
+
+/**
+ * Copies a cached result into a new deck folder of the store and answers with
+ * it. Takes over `lease` and releases it. `ms` is the conversion time, 0 when nothing was converted.
+ */
+async function publish(res: ServerResponse, lease: Lease, name: string, pptxBytes: number, ms: number) {
+  if (res.destroyed) return lease.release();
+  const id = randomUUID();
+  const dir = deckDir(id);
+  let manifest: Manifest, report: unknown, pdfBytes: number;
+  try {
+    await mkdir(dir, { recursive: true });
+    // Copies, so evicting the cache entry never breaks a deck a client already holds.
+    for (const file of await readdir(lease.dir)) await copyFile(join(lease.dir, file), join(dir, file), constants.COPYFILE_FICLONE);
+    manifest = JSON.parse(await readFile(join(dir, "manifest.json"), "utf8"));
+    report = JSON.parse(await readFile(join(dir, "report.json"), "utf8"));
+    // The same deck can arrive under another name; the manifest follows this upload.
+    if (manifest.source !== name) {
+      manifest.source = name;
+      await writeFile(join(dir, "manifest.json"), JSON.stringify(manifest));
+    }
+    pdfBytes = (await stat(join(dir, "deck.pdf"))).size;
+  } catch (e) {
+    await rm(dir, { recursive: true, force: true });
+    throw e;
+  } finally {
+    lease.release();
+  }
+  const fragmentBytes = manifest.slides.reduce((s, f) => s + f.bytes, 0);
+  json(res, 200, { id, manifest, report, sizes: { pptx: pptxBytes, pdf: pdfBytes, fragments: fragmentBytes, ms } });
 }
 
 function json(res: ServerResponse, status: number, data: unknown) {
@@ -103,59 +191,60 @@ async function handle(req: IncomingMessage, res: ServerResponse) {
 
   if (req.method === "GET" && url.pathname === "/metrics") {
     res.writeHead(200, { "content-type": "text/plain; version=0.0.4; charset=utf-8" });
-    return res.end(metrics.render(pool.stats()));
+    return res.end(metrics.render(pool.stats(), cache.bytes()));
   }
 
   if (req.method === "POST" && url.pathname === "/api/convert") {
-    const preset = (url.searchParams.get("preset") ?? "balanced") as Preset;
+    const preset = parsePreset(url.searchParams.get("preset"));
     const name = url.searchParams.get("name") ?? "deck.pptx";
-    const id = randomUUID();
-    const dir = deckDir(id);
-    await mkdir(dir, { recursive: true });
-    const upload = join(dir, "source.pptx");
+    const upload = join(cache.tmpDir, `upload-${randomUUID()}.pptx`);
     const started = performance.now();
     const endUpload = metrics.track();
-    let pptxBytes;
+    let received;
     try {
-      pptxBytes = await saveUpload(req, upload);
+      received = await saveUpload(req, upload);
     } catch (e) {
-      await rm(dir, { recursive: true, force: true });
+      await rm(upload, { force: true });
       metrics.record(req.destroyed ? "aborted" : outcomeOf(e), (performance.now() - started) / 1000);
       throw e;
     } finally {
       endUpload();
     }
+
+    const key = cache.key(received.sha256, preset);
+    const hit = cache.acquire(key);
+    if (hit) {
+      metrics.cache("hit");
+      res.setHeader(CACHE_HEADER, "hit");
+      await rm(upload, { force: true });
+      return publish(res, hit, name, received.size, 0);
+    }
+
+    // Identical decks converting at the same time share one job; it is cancelled when the last request leaves.
+    const waiter = jobs.attach(
+      key,
+      (signal) => convertJob(upload, preset, name, started, signal),
+      (staged, holds): Done => ({ lease: cache.add(key, staged.staging, staged.bytes, holds), ms: staged.ms }),
+    );
+    const result = waiter.joined ? "joined" : "miss";
+    metrics.cache(result);
+    res.setHeader(CACHE_HEADER, result);
+    res.once("close", waiter.leave);
+    // A joined request's own copy is not needed: the running job reads the first upload.
+    if (waiter.joined) await rm(upload, { force: true });
+
     const endConvert = metrics.track();
-    let out;
+    let done;
     try {
-      // Preflight in milliseconds: refuse oversized decks before converting.
-      const info = await pool.inspectFile(upload);
-      if (info.slides > MAX_SLIDES) throw new HttpError(413, `deck has ${info.slides} slides, more than the ${MAX_SLIDES} allowed`);
-      // Bounded memory: reads the deck from disk and writes each output as it is produced.
-      out = await pool.convertFile(upload, dir, { preset, sourceName: name, signal: AbortSignal.any([abortOnClose(req)]) });
+      done = await waiter.wait();
     } catch (e) {
-      await rm(dir, { recursive: true, force: true });
-      metrics.record(outcomeOf(e), (performance.now() - started) / 1000, e instanceof SlidepdfError ? e.peakBytes : undefined);
-      if (e instanceof HttpError) throw e;
-      const err = e as SlidepdfError;
-      // Each failure code maps to a status the client can act on.
-      const status = { memory: 413, timeout: 408, aborted: 499, convert: 422 }[err.code] ?? 500;
-      throw new HttpError(status, `could not convert (${err.code}): ${err.message}`);
+      throw toHttpError(e);
     } finally {
       endConvert();
-      await rm(upload, { force: true });
     }
-    metrics.record("ok", (performance.now() - started) / 1000, out.stats.peakBytes);
-    metrics.converted(out.stats.slides, out.stats.inputBytes);
-    const ms = Math.round(out.stats.ms);
-    const fragmentBytes = out.manifest.slides.reduce((s, f) => s + f.bytes, 0);
-    const pdfBytes = (await stat(join(dir, "deck.pdf"))).size;
-    return json(res, 200, {
-      id,
-      manifest: out.manifest,
-      report: out.report,
-      sizes: { pptx: pptxBytes, pdf: pdfBytes, fragments: fragmentBytes, ms },
-    });
+    // undefined: this request left before the job finished, so it holds no lease.
+    if (!done) return;
+    return publish(res, done.lease, name, received.size, done.ms);
   }
 
   const asm = url.pathname.match(/^\/api\/decks\/([^/]+)\/assemble$/);
