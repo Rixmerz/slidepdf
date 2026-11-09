@@ -344,8 +344,26 @@ but not identical, since fonts differ unless the real ones are registered.
 - `src/fragments.rs`: manifest, assemble, split
 - `bindings/wasm`, `npm/`: WebAssembly bindings and the npm package
 - `tests/`: robustness tests (corrupt, truncated and hostile inputs) and fixture
-- `scripts/`: npm build and benchmarks
+- `scripts/`: npm build, benchmarks and the corpus fetcher
 - `viewer/`: `<slide-viewer>` and the static `index.html`
+
+## Real-deck corpus test
+
+CI converts about 540 real decks (the LibreOffice `sd/qa/unit/data` and Apache
+POI `test-data/slideshow` test files) on every pull request and compares each
+result with `tests/corpus-baseline.json`. To run it locally, fetch the corpus
+once (about 180 MB) and point the ignored test at it:
+
+```sh
+scripts/corpus.sh /tmp/corpus
+SLIDEPDF_CORPUS=/tmp/corpus cargo test --release --test corpus -- --ignored
+```
+
+A deck that panics, exceeds the time cap or the 256 MB memory budget, or whose
+slide count disagrees with `inspect`, fails the test. Any other difference
+from the baseline fails it too and is printed as decks that got better or
+worse. If the change is intended, refresh the baseline with
+`SLIDEPDF_CORPUS_UPDATE=1` on the same command and commit the file.
 
 ## License
 
