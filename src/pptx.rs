@@ -677,12 +677,33 @@ fn find_ph<'a>(root: Option<&'a Node>, key: &PhKey, by_master_kind: bool) -> Opt
 
 // ---------------------------------------------------------------- transforms
 
+/// Maps coordinates inside a group (its child space) to the slide.
+///
+/// A child point first goes through `p * scale + offset`, which lands it in
+/// the group's own rect before any turning. The group's flips and rotation
+/// then act around `pivot`, the centre of that rect. Nested groups compose by
+/// placing the inner group with the outer transform and building a new
+/// `Xform` from the result, so the pivot is always in slide coordinates.
 #[derive(Debug, Clone, Copy)]
 struct Xform {
     sx: f32,
     sy: f32,
     tx: f32,
     ty: f32,
+    pivot: (f32, f32),
+    /// Clockwise degrees.
+    rot: f32,
+    flip_h: bool,
+    flip_v: bool,
+}
+
+/// A shape's rect, rotation and flips once its group transform is applied.
+#[derive(Debug, Clone, Copy)]
+struct Placed {
+    rect: Rect,
+    rotation: f32,
+    flip_h: bool,
+    flip_v: bool,
 }
 
 impl Xform {
@@ -691,16 +712,133 @@ impl Xform {
         sy: 1.0,
         tx: 0.0,
         ty: 0.0,
+        pivot: (0.0, 0.0),
+        rot: 0.0,
+        flip_h: false,
+        flip_v: false,
     };
 
-    fn rect(&self, r: Rect) -> Rect {
-        Rect {
-            x: r.x * self.sx + self.tx,
-            y: r.y * self.sy + self.ty,
-            w: r.w * self.sx,
-            h: r.h * self.sy,
+    /// True when the group only scales and moves (no turning, no mirroring).
+    fn is_plain(&self) -> bool {
+        self.rot == 0.0 && !self.flip_h && !self.flip_v
+    }
+
+    /// Places a child shape. Like PowerPoint, the group scales the child's
+    /// rect along its own axes and adds the group's turn to the child's
+    /// rotation; it never shears a rotated child. A mirrored group (exactly
+    /// one flip) also reverses the sense of the child's rotation.
+    fn place(&self, r: Rect, rotation: f32, flip_h: bool, flip_v: bool) -> Placed {
+        if self.is_plain() {
+            return Placed {
+                rect: Rect {
+                    x: r.x * self.sx + self.tx,
+                    y: r.y * self.sy + self.ty,
+                    w: r.w * self.sx,
+                    h: r.h * self.sy,
+                },
+                rotation,
+                flip_h,
+                flip_v,
+            };
+        }
+        let (w, h) = (r.w * self.sx, r.h * self.sy);
+        let mut dx = (r.x + r.w / 2.0) * self.sx + self.tx - self.pivot.0;
+        let mut dy = (r.y + r.h / 2.0) * self.sy + self.ty - self.pivot.1;
+        if self.flip_h {
+            dx = -dx;
+        }
+        if self.flip_v {
+            dy = -dy;
+        }
+        // y grows downward, so this matrix turns clockwise for positive angles.
+        let (s, c) = self.rot.to_radians().sin_cos();
+        let (cx, cy) = (self.pivot.0 + dx * c - dy * s, self.pivot.1 + dx * s + dy * c);
+        let mirrored = self.flip_h != self.flip_v;
+        let turned = if mirrored { self.rot - rotation } else { self.rot + rotation };
+        Placed {
+            rect: Rect {
+                x: cx - w / 2.0,
+                y: cy - h / 2.0,
+                w,
+                h,
+            },
+            rotation: turned.rem_euclid(360.0),
+            flip_h: self.flip_h != flip_h,
+            flip_v: self.flip_v != flip_v,
         }
     }
+
+    /// The rect of a shape that cannot turn (tables, charts): its centre is
+    /// carried along, its sides stay horizontal and vertical.
+    fn rect(&self, r: Rect) -> Rect {
+        self.place(r, 0.0, false, false).rect
+    }
+
+    /// The child space of a nested group with the given `xfrm` values.
+    fn group(&self, off: Rect, child: Rect, rotation: f32, flip_h: bool, flip_v: bool) -> Xform {
+        let p = self.place(off, rotation, flip_h, flip_v);
+        // A degenerate child extent keeps the parent's scale.
+        let sx = if child.w > 0.0 { p.rect.w / child.w } else { self.sx };
+        let sy = if child.h > 0.0 { p.rect.h / child.h } else { self.sy };
+        Xform {
+            sx,
+            sy,
+            tx: p.rect.x - child.x * sx,
+            ty: p.rect.y - child.y * sy,
+            pivot: (p.rect.x + p.rect.w / 2.0, p.rect.y + p.rect.h / 2.0),
+            rot: p.rotation,
+            flip_h: p.flip_h,
+            flip_v: p.flip_v,
+        }
+    }
+
+    /// Moves the child space origin by (`dx`, `dy`) in child units.
+    fn shifted(&self, dx: f32, dy: f32) -> Xform {
+        Xform {
+            tx: self.tx + dx * self.sx,
+            ty: self.ty + dy * self.sy,
+            ..*self
+        }
+    }
+
+    /// The text box `t` of a shape `r` that was placed at `at`. The box keeps
+    /// its offset from the shape's centre, which the shape's own rotation then
+    /// carries along when the page is drawn.
+    fn text_rect(&self, r: Rect, at: Rect, t: Rect) -> Rect {
+        if self.is_plain() {
+            return self.rect(t);
+        }
+        let cx = at.x + at.w / 2.0 + ((t.x + t.w / 2.0) - (r.x + r.w / 2.0)) * self.sx;
+        let cy = at.y + at.h / 2.0 + ((t.y + t.h / 2.0) - (r.y + r.h / 2.0)) * self.sy;
+        let (w, h) = (t.w * self.sx, t.h * self.sy);
+        Rect {
+            x: cx - w / 2.0,
+            y: cy - h / 2.0,
+            w,
+            h,
+        }
+    }
+}
+
+/// The child space of a `grpSpPr/xfrm` inside `parent`, or None when the
+/// group has no usable rect. A missing `chOff`/`chExt` means the child space
+/// is the group's own rect.
+fn group_xform(parent: &Xform, x: &Node) -> Option<Xform> {
+    let (off, ext) = (x.child("off")?, x.child("ext")?);
+    let (cho, che) = (x.child("chOff").unwrap_or(off), x.child("chExt").unwrap_or(ext));
+    let rect = |o: &Node, e: &Node| Rect {
+        x: o.attr_i64("x").unwrap_or(0) as f32,
+        y: o.attr_i64("y").unwrap_or(0) as f32,
+        w: e.attr_i64("cx").unwrap_or(0) as f32,
+        h: e.attr_i64("cy").unwrap_or(0) as f32,
+    };
+    Some(parent.group(
+        rect(off, ext),
+        rect(cho, che),
+        x.attr_i64("rot").unwrap_or(0) as f32 / 60000.0,
+        x.attr_bool("flipH").unwrap_or(false),
+        x.attr_bool("flipV").unwrap_or(false),
+    ))
 }
 
 struct RawXfrm {
@@ -1219,28 +1357,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
                         self.walk(&n.children, part, xf, template);
                         continue;
                     };
-                    let (Some(off), Some(ext)) = (x.child("off"), x.child("ext")) else {
-                        continue;
-                    };
-                    let (cho, che) = (x.child("chOff").unwrap_or(off), x.child("chExt").unwrap_or(ext));
-                    let g = |n: &Node, k| n.attr_i64(k).unwrap_or(0) as f32;
-                    let sx = if g(che, "cx") > 0.0 { g(ext, "cx") / g(che, "cx") } else { 1.0 };
-                    let sy = if g(che, "cy") > 0.0 { g(ext, "cy") / g(che, "cy") } else { 1.0 };
-                    let inner = Xform {
-                        sx,
-                        sy,
-                        tx: g(off, "x") - g(cho, "x") * sx,
-                        ty: g(off, "y") - g(cho, "y") * sy,
-                    };
-                    let combined = Xform {
-                        sx: inner.sx * xf.sx,
-                        sy: inner.sy * xf.sy,
-                        tx: inner.tx * xf.sx + xf.tx,
-                        ty: inner.ty * xf.sy + xf.ty,
-                    };
-                    if x.attr_i64("rot").unwrap_or(0) != 0 {
-                        self.warn("rotated groups are drawn unrotated");
-                    }
+                    let Some(combined) = group_xform(&xf, x) else { continue };
                     self.walk(&n.children, part, combined, template);
                 }
                 "AlternateContent" => {
@@ -1275,7 +1392,8 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         let Some(rid) = n.path(&["blipFill", "blip"]).and_then(|b| b.attr("embed")) else {
             return;
         };
-        if self.metafile(part, rid, xf.rect(x.rect)) {
+        let placed = xf.place(x.rect, x.rot, x.flip_h, x.flip_v);
+        if self.metafile(part, rid, placed.rect) {
             return;
         }
         let Some(media) = self.media(part, rid) else { return };
@@ -1287,12 +1405,12 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             })
             .unwrap_or([0.0; 4]);
         self.elements.push(Element::Picture(Picture {
-            rect: xf.rect(x.rect),
-            rotation: x.rot,
+            rect: placed.rect,
+            rotation: placed.rotation,
             media,
             crop,
-            flip_h: x.flip_h,
-            flip_v: x.flip_v,
+            flip_h: placed.flip_h,
+            flip_v: placed.flip_v,
         }));
     }
 
@@ -1300,7 +1418,8 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         let Some(x) = self.resolve_xfrm(n, ph) else { return };
         let (lph, mph) = self.inherited(ph);
         let (lph, mph) = (lph.cloned(), mph.cloned());
-        let rect = xf.rect(x.rect);
+        let placed = xf.place(x.rect, x.rot, x.flip_h, x.flip_v);
+        let rect = placed.rect;
         let cc = self.cc();
 
         // p:style supplies theme-referenced defaults for autoshapes.
@@ -1382,16 +1501,16 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         }
         self.elements.push(Element::Shape(Shape {
             rect,
-            rotation: x.rot,
-            flip_h: x.flip_h,
-            flip_v: x.flip_v,
+            rotation: placed.rotation,
+            flip_h: placed.flip_h,
+            flip_v: placed.flip_v,
             geometry,
             fill,
             stroke,
             text,
             is_title,
             // SmartArt shapes carry their own text box (txXfrm).
-            text_rect: n.child("txXfrm").and_then(parse_xfrm).map(|t| xf.rect(t.rect)),
+            text_rect: n.child("txXfrm").and_then(parse_xfrm).map(|t| xf.text_rect(x.rect, rect, t.rect)),
         }));
     }
 
@@ -1925,17 +2044,18 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             let rid = pic.and_then(|p| p.path(&["blipFill", "blip"])).and_then(|b| b.attr("embed"));
             match (rid, n.child("xfrm").and_then(parse_xfrm)) {
                 (Some(rid), Some(x)) => {
-                    if self.metafile(part, rid, xf.rect(x.rect)) {
+                    let placed = xf.place(x.rect, x.rot, false, false);
+                    if self.metafile(part, rid, placed.rect) {
                         return;
                     }
                     if let Some(media) = self.media(part, rid) {
                         self.elements.push(Element::Picture(Picture {
-                            rect: xf.rect(x.rect),
-                            rotation: x.rot,
+                            rect: placed.rect,
+                            rotation: placed.rotation,
                             media,
                             crop: [0.0; 4],
-                            flip_h: false,
-                            flip_v: false,
+                            flip_h: placed.flip_h,
+                            flip_v: placed.flip_v,
                         }));
                     }
                 }
@@ -2079,14 +2199,8 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         let rels = self.pkg.rels(&path);
         let drawing = Part { root, rels };
         let Some(tree) = drawing.root.child("spTree") else { return false };
-        let inner = Xform {
-            sx: xf.sx,
-            sy: xf.sy,
-            tx: frame.x * xf.sx + xf.tx,
-            ty: frame.y * xf.sy + xf.ty,
-        };
         self.in_diagram = true;
-        self.walk(&tree.children, &drawing, inner, false);
+        self.walk(&tree.children, &drawing, xf.shifted(frame.x, frame.y), false);
         self.in_diagram = false;
         true
     }
@@ -2455,5 +2569,116 @@ mod tests {
             ph: None,
         };
         assert_eq!(cc.color(&n), Some(Rgb(128, 0, 0)));
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    fn assert_placed(p: Placed, rect: [f32; 4], rotation: f32, flips: (bool, bool)) {
+        let got = [p.rect.x, p.rect.y, p.rect.w, p.rect.h];
+        assert!(got.iter().zip(rect).all(|(a, b)| close(*a, b)), "rect {got:?} != {rect:?}");
+        assert!(close(p.rotation, rotation), "rotation {} != {rotation}", p.rotation);
+        assert_eq!((p.flip_h, p.flip_v), flips);
+    }
+
+    fn group(parent: &Xform, attrs: &str, off: (i64, i64), ext: (i64, i64), ch: (i64, i64, i64, i64)) -> Xform {
+        let xml = format!(
+            r#"<p:xfrm {attrs}><a:off x="{}" y="{}"/><a:ext cx="{}" cy="{}"/><a:chOff x="{}" y="{}"/><a:chExt cx="{}" cy="{}"/></p:xfrm>"#,
+            off.0, off.1, ext.0, ext.1, ch.0, ch.1, ch.2, ch.3
+        );
+        group_xform(parent, &xml::parse(xml.as_bytes()).unwrap()).unwrap()
+    }
+
+    fn rect(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn plain_group_scales_and_moves() {
+        let g = group(&Xform::ID, "", (1000, 500), (4000, 2000), (0, 0, 2000, 1000));
+        let p = g.place(rect(100.0, 100.0, 200.0, 50.0), 30.0, true, false);
+        assert_placed(p, [1200.0, 700.0, 400.0, 100.0], 30.0, (true, false));
+    }
+
+    #[test]
+    fn rotated_group_turns_children_around_its_centre() {
+        // 90 degrees clockwise: the child in the top-left corner of the group
+        // ends up in the top-right corner of the turned box.
+        let g = group(&Xform::ID, r#"rot="5400000""#, (1000, 1000), (2000, 1000), (0, 0, 2000, 1000));
+        let p = g.place(rect(0.0, 0.0, 1000.0, 500.0), 0.0, false, false);
+        assert_placed(p, [1750.0, 750.0, 1000.0, 500.0], 90.0, (false, false));
+    }
+
+    #[test]
+    fn rotated_group_adds_to_the_childs_own_rotation_and_flip() {
+        let g = group(&Xform::ID, r#"rot="5400000""#, (1000, 1000), (2000, 1000), (0, 0, 2000, 1000));
+        let p = g.place(rect(0.0, 0.0, 1000.0, 500.0), 30.0, true, false);
+        assert_placed(p, [1750.0, 750.0, 1000.0, 500.0], 120.0, (true, false));
+    }
+
+    #[test]
+    fn flipped_group_mirrors_children_and_reverses_their_rotation() {
+        // flipH about the group centre (x = 1000): a child at the left edge
+        // moves to the right edge; a child turned 30 degrees now leans the other way.
+        let g = group(&Xform::ID, r#"flipH="1""#, (0, 0), (2000, 1000), (0, 0, 2000, 1000));
+        let p = g.place(rect(0.0, 0.0, 500.0, 500.0), 30.0, false, false);
+        assert_placed(p, [1500.0, 0.0, 500.0, 500.0], 330.0, (true, false));
+        // Flipping an already flipped child cancels out.
+        let p = g.place(rect(0.0, 0.0, 500.0, 500.0), 0.0, true, true);
+        assert_placed(p, [1500.0, 0.0, 500.0, 500.0], 0.0, (false, true));
+    }
+
+    #[test]
+    fn rotated_and_flipped_group_with_flipped_child() {
+        // flipH then 90 degrees clockwise, around the centre (2000, 1500).
+        let g = group(
+            &Xform::ID,
+            r#"rot="5400000" flipH="1""#,
+            (1000, 1000),
+            (2000, 1000),
+            (0, 0, 2000, 1000),
+        );
+        let p = g.place(rect(0.0, 0.0, 1000.0, 500.0), 30.0, true, false);
+        // The child centre sits (-500, -250) from the pivot; flipH gives (500, -250),
+        // the quarter turn (250, 500), so the centre lands at (2250, 2000). A mirrored
+        // group reverses the child's 30 degrees (90 - 30), and the two flips cancel.
+        assert_placed(p, [1750.0, 1750.0, 1000.0, 500.0], 60.0, (false, false));
+    }
+
+    #[test]
+    fn nested_groups_compose_scale_and_turn() {
+        // The outer group doubles its children; the inner one (500,0 1000x1000
+        // in outer child units) turns 90 degrees.
+        let outer = group(&Xform::ID, "", (0, 0), (4000, 2000), (0, 0, 2000, 1000));
+        let inner = group(&outer, r#"rot="5400000""#, (500, 0), (1000, 1000), (0, 0, 100, 100));
+        assert!(close(inner.sx, 20.0) && close(inner.sy, 20.0));
+        let p = inner.place(rect(0.0, 0.0, 50.0, 50.0), 0.0, false, false);
+        assert_placed(p, [2000.0, 0.0, 1000.0, 1000.0], 90.0, (false, false));
+    }
+
+    #[test]
+    fn nested_rotations_add_up() {
+        let outer = group(&Xform::ID, r#"rot="5400000""#, (0, 0), (2000, 2000), (0, 0, 2000, 2000));
+        let inner = group(&outer, r#"rot="5400000""#, (0, 0), (1000, 1000), (0, 0, 1000, 1000));
+        let p = inner.place(rect(0.0, 0.0, 500.0, 500.0), 0.0, false, false);
+        assert_placed(p, [1500.0, 500.0, 500.0, 500.0], 180.0, (false, false));
+    }
+
+    #[test]
+    fn group_without_child_extent_keeps_the_parent_scale() {
+        let outer = group(&Xform::ID, "", (0, 0), (4000, 2000), (0, 0, 2000, 1000));
+        let inner = group(&outer, "", (100, 100), (500, 500), (0, 0, 0, 0));
+        assert!(close(inner.sx, 2.0) && close(inner.sy, 2.0));
+    }
+
+    #[test]
+    fn text_box_keeps_its_offset_from_a_turned_shape() {
+        let g = group(&Xform::ID, r#"rot="5400000""#, (0, 0), (2000, 2000), (0, 0, 2000, 2000));
+        let shape = rect(0.0, 0.0, 1000.0, 1000.0);
+        let at = g.place(shape, 0.0, false, false).rect;
+        let t = g.text_rect(shape, at, rect(100.0, 100.0, 800.0, 800.0));
+        assert!(close(t.x + t.w / 2.0, at.x + at.w / 2.0));
+        assert!(close(t.w, 800.0) && close(t.h, 800.0));
     }
 }
