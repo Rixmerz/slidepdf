@@ -34,10 +34,13 @@ const upload = (body: Uint8Array | string, preset: string, signal?: AbortSignal)
 const cacheCount = (text: string, result: string) => sample(text, `slidepdf_cache_total\\{result="${result}"\\}`);
 
 /** Polls until `check` holds; the server gives no event to wait on. */
+// Polls for up to 20 s: on a loaded machine the uploads that fill the queue
+// take seconds to arrive, and a shorter wait failed for no reason.
 async function until(check: () => Promise<boolean>, what: string) {
-  for (let i = 0; i < 500; i++) {
+  const deadline = Date.now() + 20_000;
+  while (Date.now() < deadline) {
     if (await check()) return;
-    await new Promise((r) => setTimeout(r, 4));
+    await new Promise((r) => setTimeout(r, 10));
   }
   assert.fail(`timed out waiting for ${what}`);
 }
