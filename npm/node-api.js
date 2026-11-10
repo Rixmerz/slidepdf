@@ -49,14 +49,29 @@ export function makeNodeApi(glue) {
    * Converts a PPTX file into `outDir` with bounded memory: the package is
    * read from disk in pieces and every output is written as soon as it is
    * ready (slide-NNN.pdf, deck.pdf, manifest.json, report.json).
+   * `names` renames deck.pdf, manifest.json and report.json, or skips one
+   * with `false`, for stores that only accept some extensions.
    */
   function convertFile(input, outDir, options = {}) {
     const fs = require("node:fs");
     const path = require("node:path");
+    const { onProgress, shouldCancel, names = {}, ...opts } = options;
+    const name = (key, fallback) => {
+      const n = names[key];
+      if (n === undefined || n === true) return fallback;
+      if (n === false) return null;
+      if (typeof n !== "string" || n === "" || n !== path.basename(n)) {
+        throw new TypeError(`names.${key} must be a file name without a directory, or false`);
+      }
+      return n;
+    };
+    const deckName = name("deck", "deck.pdf");
+    const manifestName = name("manifest", "manifest.json");
+    const reportName = name("report", "report.json");
+    if (deckName === null) opts.fullPdf = false;
     fs.mkdirSync(outDir, { recursive: true });
-    const { onProgress, shouldCancel, ...opts } = options;
     const source = openSource(input);
-    const pdfFd = opts.fullPdf === false ? null : fs.openSync(path.join(outDir, "deck.pdf"), "w");
+    const pdfFd = opts.fullPdf === false ? null : fs.openSync(path.join(outDir, deckName), "w");
     try {
       const out = api.convertStream(source, { sourceName: path.basename(input), ...opts }, {
         onFragment: (f) => fs.writeFileSync(path.join(outDir, f.file), f.pdf),
@@ -66,8 +81,16 @@ export function makeNodeApi(glue) {
         // Both callbacks write synchronously, so views into wasm memory are safe.
         zeroCopy: true,
       });
-      fs.writeFileSync(path.join(outDir, "manifest.json"), out.manifestJson);
-      fs.writeFileSync(path.join(outDir, "report.json"), JSON.stringify(out.report));
+      if (pdfFd !== null && deckName !== "deck.pdf") {
+        // The manifest names the full PDF; keep it pointing at the renamed file.
+        out.manifestJson = out.manifestJson.replace(
+          /("pdf": \{ "file": )"deck\.pdf"/,
+          (_, head) => head + JSON.stringify(deckName),
+        );
+        if (out.manifest?.pdf) out.manifest.pdf.file = deckName;
+      }
+      if (manifestName !== null) fs.writeFileSync(path.join(outDir, manifestName), out.manifestJson);
+      if (reportName !== null) fs.writeFileSync(path.join(outDir, reportName), JSON.stringify(out.report));
       return out;
     } finally {
       source.close();

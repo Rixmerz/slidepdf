@@ -177,8 +177,27 @@ export function convert(pptx: Bytes, options?: ConvertOptions): Conversion;
  */
 export function convertStream(source: ByteSource | Bytes, options: ConvertOptions, callbacks: StreamCallbacks): StreamResult;
 
+/**
+ * Names of the files `convertFile` writes next to the fragments. A string
+ * renames the file (no directory), `false` skips it. Renaming the deck
+ * updates the manifest's `pdf.file`; skipping it is `fullPdf: false`.
+ */
+export interface OutputNames {
+  /** Default "deck.pdf". */
+  deck?: string | false;
+  /** Default "manifest.json"; any name works, the viewer only needs its URL. */
+  manifest?: string | false;
+  /** Default "report.json". */
+  report?: string | false;
+}
+
+export interface ConvertFileOptions extends ConvertOptions {
+  onProgress?: (done: number, total: number) => void;
+  names?: OutputNames;
+}
+
 /** Node only: converts a .pptx file into `outDir` (slide-NNN.pdf, deck.pdf, manifest.json, report.json) with bounded memory. */
-export function convertFile(input: string, outDir: string, options?: ConvertOptions & { onProgress?: (done: number, total: number) => void }): StreamResult;
+export function convertFile(input: string, outDir: string, options?: ConvertFileOptions): StreamResult;
 
 /** Sizes up a deck in milliseconds without converting it, to decide its queue or refuse it. */
 export function inspect(pptx: ByteSource | Bytes): Inspection;
@@ -236,7 +255,7 @@ export interface PoolStats {
 
 /** Node only: worker threads with a memory cap, a timeout and cancellation per job. See the README's "Running in pods". */
 export interface Pool {
-  convertFile(input: string, outDir: string, options?: ConvertOptions & JobOptions): Promise<StreamResult>;
+  convertFile(input: string, outDir: string, options?: ConvertFileOptions & JobOptions): Promise<StreamResult>;
   inspectFile(input: string, options?: JobOptions): Promise<Inspection>;
   assembleFiles(inputs: string[], outPath: string, options?: JobOptions): Promise<number>;
   /** Spawns all workers now. */
@@ -249,7 +268,7 @@ export interface Pool {
 export function createPool(options?: PoolOptions): Pool;
 
 /** Node only: one conversion in its own worker thread, whose memory is released when it ends. */
-export function convertFileInWorker(input: string, outDir: string, options?: ConvertOptions & JobOptions): Promise<StreamResult>;
+export function convertFileInWorker(input: string, outDir: string, options?: ConvertFileOptions & JobOptions): Promise<StreamResult>;
 
 /**
  * Bounded-memory merge: `next()` returns the next PDF or null when done;

@@ -6,6 +6,31 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-10
+
+### Added
+
+- `convertFile` takes `names: { deck, manifest, report }` to rename its
+  outputs or skip one with `false`, for stores with extension allowlists;
+  README section "Storing the output".
+- Viewer `thumbnails="lazy|eager|off"` attribute.
+- Registered icon fonts (Material Icons, Material Symbols) draw the icon:
+  the font's `liga` ligature replaces the icon name.
+
+### Changed
+
+- Missing fonts are reported once per family, with the weights the deck
+  uses, instead of one line per weight ("Montserrat", "Montserrat Black"...).
+- Viewer: thumbnails wait for the first slide and load two at a time, and
+  fragment bytes are cached (8 slides), so a thumbnail and a visit download
+  once.
+
+### Fixed
+
+- Text in an unregistered icon font is no longer drawn as the ligature's
+  name ("play_circle_filled"); the icon is left blank and reported per slide
+  as "icon font ... is not available; N icons left blank".
+
 ## [0.5.0] - 2026-11-10
 
 Fidelity release: the shapes, groups and diagrams that were still simplified

@@ -349,7 +349,8 @@ pub fn convert_stream_with<R: Read + Seek>(
     }
 
     let mut warnings = deck.warnings.clone();
-    for w in r.warnings.drain(..) {
+    let fonts = r.font_warnings();
+    for w in r.warnings.drain(..).chain(fonts) {
         if !warnings.contains(&w) {
             warnings.push(w);
         }

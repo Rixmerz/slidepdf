@@ -9,6 +9,9 @@
 //   pdfjs          base URL of a pdf.js 3.x build (default: cdnjs)
 //   show-warnings  show the fidelity warnings of the current slide
 //   view-threshold ms on screen before a slide counts as viewed (default 2000)
+//   thumbnails     lazy (default): draw thumbnails as they scroll into view,
+//                  after the first slide is shown, two at a time; eager: draw
+//                  them all once the first slide is shown; off: numbers only
 //   lang           language of the built-in texts: en (default) or es; the
 //                  nearest ancestor's lang applies when the element has none
 //
@@ -86,6 +89,10 @@ const LABELS = {
   },
 };
 
+// Fragments whose bytes are kept, and thumbnails drawn at the same time.
+const BYTES_CACHE = 8;
+const THUMBS_IN_FLIGHT = 2;
+
 // What a loader or fetch returned, as bytes or as the manifest object.
 async function asBytes(r) {
   if (r instanceof Response) {
@@ -157,7 +164,7 @@ const CSS = `
 `;
 
 class SlideViewer extends HTMLElement {
-  static get observedAttributes() { return ["manifest", "lang"]; }
+  static get observedAttributes() { return ["manifest", "lang", "thumbnails"]; }
 
   constructor() {
     super();
@@ -165,6 +172,12 @@ class SlideViewer extends HTMLElement {
     this.manifest = null;
     this.current = 0;
     this._docs = new Map();
+    // Fragment bytes by URL, most recent last: a thumbnail followed by a
+    // visit (or a slide evicted and reopened) downloads once. Bytes, not
+    // pdf.js documents, which hold decoded images.
+    this._bytes = new Map();
+    this._thumbQueue = [];
+    this._thumbsBusy = 0;
     this._seen = new Set();
     this._enteredAt = 0;
     this._startedAt = 0;
@@ -220,16 +233,29 @@ class SlideViewer extends HTMLElement {
     return res.json();
   }
 
-  // Opens fragment i as a pdf.js document, through the loader or with the
-  // request options when given.
+  // The bytes of fragment `url`, through the loader or with the request
+  // options when given, kept in a small LRU.
+  _fetchBytes(url) {
+    let p = this._bytes.get(url);
+    if (p) {
+      this._bytes.delete(url);
+    } else {
+      p = this._loader
+        ? Promise.resolve(this._loader(url, "slide")).then(asBytes)
+        : fetch(url, this._requestInit).then(asBytes);
+      p.catch(() => this._bytes.get(url) === p && this._bytes.delete(url));
+    }
+    this._bytes.set(url, p);
+    while (this._bytes.size > BYTES_CACHE) this._bytes.delete(this._bytes.keys().next().value);
+    return p;
+  }
+
+  // Opens fragment i as a pdf.js document.
   async _open(i) {
     const url = new URL(this.manifest.slides[i].file, this._base).href;
-    if (this._loader) return this._lib.getDocument({ data: await asBytes(await this._loader(url, "slide")) }).promise;
-    const params = { url, disableAutoFetch: true };
-    const init = this._requestInit;
-    if (init && init.headers) params.httpHeaders = Object.fromEntries(new Headers(init.headers));
-    if (init && init.credentials === "include") params.withCredentials = true;
-    return this._lib.getDocument(params).promise;
+    const bytes = await this._fetchBytes(url);
+    // pdf.js takes ownership of the buffer it is given; keep ours.
+    return this._lib.getDocument({ data: bytes.slice() }).promise;
   }
 
   connectedCallback() {
@@ -291,6 +317,7 @@ class SlideViewer extends HTMLElement {
   attributeChangedCallback(name, oldV, newV) {
     if (oldV === newV || !this._els) return;
     if (name === "manifest") this._scheduleLoad();
+    else if (name === "thumbnails") { if (this.manifest) { this._buildThumbs(); this._pumpThumbs(); } }
     else this._applyLabels();
   }
 
@@ -302,6 +329,9 @@ class SlideViewer extends HTMLElement {
     this._leave();
     this._docs.forEach((p) => p.then((d) => d.destroy()).catch(() => {}));
     this._docs.clear();
+    this._bytes.clear();
+    this._thumbQueue = [];
+    this._firstShown = false;
     this.current = 0;
     this._renderToken++;
     this.manifest = null;
@@ -409,22 +439,52 @@ class SlideViewer extends HTMLElement {
     } catch {
       if (token === this._renderToken) this._els.loading.textContent = this._t("slideError");
     }
+    // Thumbnails wait for the first slide, so it is never the last to arrive.
+    if (!this._firstShown) {
+      this._firstShown = true;
+      this._pumpThumbs();
+    }
     // Prefetch neighbours so the next click is instant, and drop the rest.
     [this.current + 1, this.current - 1].filter((j) => j >= 0 && j < this.count).forEach((j) => this._doc(j));
     this._evict();
   }
 
+  get _thumbMode() {
+    const m = (this.getAttribute("thumbnails") || "lazy").toLowerCase();
+    return m === "eager" || m === "off" ? m : "lazy";
+  }
+
+  // Draws queued thumbnails, at most THUMBS_IN_FLIGHT at a time, once the
+  // first slide is on screen.
+  _pumpThumbs() {
+    if (!this._firstShown || !this.manifest) return;
+    const deck = this.manifest;
+    while (this._thumbsBusy < THUMBS_IN_FLIGHT && this._thumbQueue.length) {
+      const t = this._thumbQueue.shift();
+      this._thumbsBusy++;
+      this._drawThumb(+t.dataset.i, t.querySelector("canvas"), 120)
+        .catch(() => {})
+        .finally(() => {
+          this._thumbsBusy--;
+          if (this.manifest === deck) this._pumpThumbs();
+        });
+    }
+  }
+
   _buildThumbs() {
     const box = this._els.thumbs;
     box.innerHTML = "";
+    this._thumbQueue = [];
     this._io && this._io.disconnect();
+    const mode = this._thumbMode;
     this._io = new IntersectionObserver((entries) => {
       entries.forEach((en) => {
         if (!en.isIntersecting) return;
         const t = en.target;
         this._io.unobserve(t);
-        this._drawThumb(+t.dataset.i, t.querySelector("canvas"), 120).catch(() => {});
+        this._thumbQueue.push(t);
       });
+      this._pumpThumbs();
     }, { root: box, rootMargin: "0px 300px" });
     this.manifest.slides.forEach((s, i) => {
       const b = document.createElement("button");
@@ -440,7 +500,8 @@ class SlideViewer extends HTMLElement {
       b.append(document.createElement("canvas"), num);
       b.onclick = () => this.goTo(i + 1);
       box.appendChild(b);
-      this._io.observe(b);
+      if (mode === "lazy") this._io.observe(b);
+      else if (mode === "eager") this._thumbQueue.push(b);
     });
   }
 
