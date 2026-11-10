@@ -275,6 +275,23 @@ fn the_chart_of_an_embedded_workbook_is_redrawn() {
 }
 
 #[test]
+fn the_chart_of_an_embedded_workbook_turns_with_its_group() {
+    let object = frame_xml(r#"progId="Excel.Sheet.12""#, "");
+    let plain = parse(&deck(&object, Some(("workbook1.xlsx", &workbook(Some(BARS)))), None));
+    let turned = parse(&deck(&turned(&object), Some(("workbook1.xlsx", &workbook(Some(BARS)))), None));
+    let (flat, quarter) = (shapes(&plain), shapes(&turned));
+    assert_eq!(flat.len(), quarter.len());
+    assert!(flat.iter().all(|s| s.rotation == 0.0));
+    // Every piece is carried to a different place; the group is not ignored.
+    let moved = flat
+        .iter()
+        .zip(&quarter)
+        .filter(|(a, b)| rect_of(a) != rect_of(b) || a.rotation != b.rotation)
+        .count();
+    assert!(moved > flat.len() / 2, "{moved} of {} pieces turned", flat.len());
+}
+
+#[test]
 fn a_workbook_without_a_chart_gets_the_placeholder() {
     let bytes = deck(
         &frame_xml(r#"name="Sheet" progId="Excel.Sheet.12""#, ""),

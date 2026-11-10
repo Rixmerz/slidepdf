@@ -2197,8 +2197,9 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
     }
 
     /// The first chart of an embedded workbook (`.xlsx`), redrawn from the
-    /// values cached in its chart part. The workbook is read once, into memory
-    /// no longer than this call, and only that one part is inflated.
+    /// values cached in its chart part. The workbook is read once, counted
+    /// against the deck's inflate budget (it is never read again), and held
+    /// no longer than this call; only that one part is inflated from it.
     fn ole_chart(&mut self, part: &Part, rid: &str, x: &RawXfrm, xf: Xform) -> bool {
         let Some(target) = part.rels.get(rid).map(|r| r.target.clone()) else {
             return false;
@@ -2208,7 +2209,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             return false;
         }
         let root = {
-            let Some(bytes) = self.pkg.read_media(&target) else { return false };
+            let Some(bytes) = self.pkg.read(&target) else { return false };
             let Ok(mut workbook) = Package::from_bytes(&bytes) else {
                 return false;
             };
