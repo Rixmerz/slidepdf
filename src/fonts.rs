@@ -203,7 +203,7 @@ pub fn run_weight(face: &str, bold: bool) -> u16 {
     }
 }
 
-fn weight_name(w: u16) -> &'static str {
+pub(crate) fn weight_name(w: u16) -> &'static str {
     match w {
         100 => "Thin",
         200 => "ExtraLight",
@@ -215,6 +215,57 @@ fn weight_name(w: u16) -> &'static str {
         900 => "Black",
         _ => "Regular",
     }
+}
+
+/// Whether a typeface is a ligature-based icon font, where a word such as
+/// `play_circle_filled` stands for one icon glyph. Drawn with any other
+/// font, the run would show the ligature's name instead of the icon.
+pub fn is_icon_face(face: &str) -> bool {
+    let f = face.trim().to_lowercase();
+    ["material icons", "material symbols", "material design icons"]
+        .iter()
+        .any(|p| f.starts_with(p))
+}
+
+/// The glyph a font's `liga`/`rlig` ligatures turn the whole of `text`
+/// into, with its advance in 1/1000 em; `None` when no single ligature
+/// covers it. Icon fonts map each icon name to one such ligature.
+#[cfg(feature = "fonts")]
+pub fn ligature(font: &FontFile, text: &str) -> Option<(u16, f32)> {
+    use ttf_parser::gsub::SubstitutionSubtable;
+    let mut face = ttf_parser::Face::parse(&font.data, 0).ok()?;
+    if let Some(w) = font.instance {
+        face.set_variation(ttf_parser::Tag::from_bytes(b"wght"), w);
+    }
+    let gids: Vec<ttf_parser::GlyphId> = text.chars().map(|c| face.glyph_index(c)).collect::<Option<_>>()?;
+    let (&first, rest) = gids.split_first()?;
+    let gsub = face.tables().gsub?;
+    for feature in gsub.features {
+        if feature.tag != ttf_parser::Tag::from_bytes(b"liga") && feature.tag != ttf_parser::Tag::from_bytes(b"rlig") {
+            continue;
+        }
+        for li in feature.lookup_indices {
+            let Some(lookup) = gsub.lookups.get(li) else { continue };
+            for sub in lookup.subtables.into_iter::<SubstitutionSubtable>() {
+                let SubstitutionSubtable::Ligature(l) = sub else { continue };
+                let Some(set) = l.coverage.get(first).and_then(|i| l.ligature_sets.get(i)) else {
+                    continue;
+                };
+                for lig in set {
+                    if lig.components.len() as usize == rest.len() && lig.components.into_iter().eq(rest.iter().copied()) {
+                        let adv = face.glyph_hor_advance(lig.glyph).unwrap_or(0) as f32 * 1000.0 / font.units_per_em;
+                        return Some((lig.glyph.0, adv));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(feature = "fonts"))]
+pub fn ligature(_font: &FontFile, _text: &str) -> Option<(u16, f32)> {
+    None
 }
 
 /// Per-document state of one embedded font: which glyphs were used.
@@ -251,6 +302,25 @@ impl Usage {
         let new = remapper.remap(old);
         self.glyphs.entry(new).or_insert((c, adv));
         Some((new, adv))
+    }
+
+    /// Adds glyph `old` of the font (a ligature, found by [`ligature`]) to
+    /// the subset; `c` is the character it is extracted as.
+    #[cfg(feature = "fonts")]
+    pub fn glyph_id(&mut self, old: u16, adv: f32, c: char) -> u16 {
+        let remapper = self.remapper.get_or_insert_with(|| {
+            let mut r = subsetter::GlyphRemapper::new();
+            r.remap(0);
+            r
+        });
+        let new = remapper.remap(old);
+        self.glyphs.entry(new).or_insert((c, adv));
+        new
+    }
+
+    #[cfg(not(feature = "fonts"))]
+    pub fn glyph_id(&mut self, old: u16, _adv: f32, _c: char) -> u16 {
+        old
     }
 
     #[cfg(not(feature = "fonts"))]
@@ -306,6 +376,14 @@ mod tests {
         // A lone word is a family, never a weight.
         assert_eq!(face_style("Black"), ("black".into(), None, false));
         assert_eq!(face_style("Times New Roman"), ("times new roman".into(), None, false));
+    }
+
+    #[test]
+    fn material_fonts_are_icon_fonts() {
+        assert!(is_icon_face("Material Icons"));
+        assert!(is_icon_face("Material Icons Outlined"));
+        assert!(is_icon_face("Material Symbols Rounded"));
+        assert!(!is_icon_face("Montserrat"));
     }
 
     #[test]

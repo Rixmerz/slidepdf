@@ -16,7 +16,7 @@ use std::rc::Rc;
 use pdf_writer::types::{FunctionShadingType, Predictor};
 use pdf_writer::{Chunk, Content, Filter, Name, Rect as PRect, Ref, Settings, Str};
 
-use crate::fonts::{face_style, run_weight, subset_tag, FontFile, Usage};
+use crate::fonts::{face_style, is_icon_face, ligature, run_weight, subset_tag, FontFile, Usage};
 use crate::images::{self, ColorSpace, Prepared, Target};
 use crate::ir::*;
 use crate::metrics;
@@ -89,6 +89,9 @@ struct Fonts<'f, 'u> {
     missing: Vec<char>,
     /// Typefaces drawn with a base-14 font instead, with that font's family.
     substituted: Vec<(String, &'static str)>,
+    /// Icons in an icon font that is not registered, left blank, with the
+    /// number of them per typeface.
+    icons: Vec<(String, usize)>,
 }
 
 /// Typefaces the base-14 fonts stand in for without visible loss: the
@@ -144,6 +147,48 @@ impl Fonts<'_, '_> {
             // Named by family only: the same typeface is drawn bold and regular.
             self.substituted.push((r.face.clone(), FontKey(key.0, false, false).base_name()));
         }
+    }
+
+    /// A run that is one icon name (`play_circle_filled`) in an icon font:
+    /// the font's ligature glyph when the font is registered, otherwise a
+    /// blank one em wide, so the ligature's name is never drawn as words.
+    /// `None` for any other run.
+    fn icon(&mut self, r: &Run, run: usize) -> Option<Glyph> {
+        let name = r.text.trim();
+        if !is_icon_face(&r.face) || name.is_empty() || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+            return None;
+        }
+        if let Some(i) = self.matching(r) {
+            if let Some((old, adv)) = ligature(&self.files[i], name) {
+                let first = name.chars().next().unwrap_or(' ');
+                let gid = self.usage[i].glyph_id(old, adv, first);
+                return Some(Glyph {
+                    font: FontId::Emb(i),
+                    code: gid.to_be_bytes(),
+                    len: 2,
+                    adv,
+                    nat: adv,
+                    space: false,
+                    run,
+                });
+            }
+            // A registered file without that ligature: draw the name as text.
+            return None;
+        }
+        match self.icons.iter_mut().find(|(f, _)| *f == r.face) {
+            Some((_, n)) => *n += 1,
+            None => self.icons.push((r.face.clone(), 1)),
+        }
+        let key = FontKey::of(r);
+        Some(Glyph {
+            font: FontId::Base(key),
+            code: [b' ', 0],
+            len: 1,
+            adv: 1000.0,
+            nat: char_width(key, b' ') * 1000.0,
+            space: false,
+            run,
+        })
     }
 
     fn glyph(&mut self, r: &Run, run: usize, c: char) -> Glyph {
@@ -346,6 +391,66 @@ pub struct Renderer<'d> {
     /// Slide being drawn, so image problems are reported on it.
     current_slide: Option<usize>,
     pub warnings: Vec<Warning>,
+    /// Typefaces drawn with a base-14 font, deck-wide; reported grouped by
+    /// family by [`Renderer::font_warnings`].
+    substituted: Vec<(String, &'static str)>,
+}
+
+impl Renderer<'_> {
+    /// One warning per font family drawn with a base-14 font, naming the
+    /// weights the deck asked for: "Montserrat" and "Montserrat Black" are
+    /// one family to register, not two fonts to find.
+    pub fn font_warnings(&self) -> Vec<Warning> {
+        group_substitutions(&self.substituted)
+            .into_iter()
+            .map(|message| Warning { slide: None, message })
+            .collect()
+    }
+}
+
+/// A family as the deck spells it, its base-14 stand-in and the
+/// (weight, italic, typeface) of each face asked for.
+type FamilyFaces<'a> = (String, &'a str, Vec<(u16, bool, String)>);
+
+fn group_substitutions(faces: &[(String, &'static str)]) -> Vec<String> {
+    // (display family, base font, [(weight, italic, typeface)])
+    let mut families: Vec<FamilyFaces> = Vec::new();
+    for (face, base) in faces {
+        let (family, weight, italic) = face_style(face);
+        // The family as the deck spells it: the leading words of the typeface.
+        let n = family.split_whitespace().count();
+        let display = face.split_whitespace().take(n).collect::<Vec<_>>().join(" ");
+        let style = (weight.unwrap_or(400), italic, face.clone());
+        match families.iter_mut().find(|(d, ..)| d.to_lowercase() == family) {
+            Some((_, _, v)) => v.push(style),
+            None => families.push((display, base, vec![style])),
+        }
+    }
+    let hint = "line breaks may differ (to embed it, register the font file with a preset other than light)";
+    families
+        .into_iter()
+        .map(|(family, base, mut styles)| {
+            if let [(_, _, face)] = styles.as_slice() {
+                return format!("font '{face}' is not available and was drawn with {base}; {hint}");
+            }
+            styles.sort();
+            let names: Vec<String> = styles
+                .iter()
+                .map(|(w, i, _)| {
+                    let w = crate::fonts::weight_name(*w);
+                    match (*i, w) {
+                        (true, "Regular") => "Italic".to_string(),
+                        (true, w) => format!("{w} Italic"),
+                        (false, w) => w.to_string(),
+                    }
+                })
+                .collect();
+            format!(
+                "font family '{family}' is not available (weights: {}) and was drawn with {base}; line breaks may differ (to embed it, register a variable font file, or one static file per weight, with a preset other than light)",
+                names.join(", ")
+            )
+        })
+        .collect()
 }
 
 /// One PDF being written. Objects go to the writer as soon as they are
@@ -527,6 +632,7 @@ impl<'d> Renderer<'d> {
             cache_used: 0,
             current_slide: None,
             warnings: Vec::new(),
+            substituted: Vec::new(),
         }
     }
 
@@ -640,6 +746,7 @@ impl<'d> Renderer<'d> {
         let font_files = std::mem::take(&mut self.opts.fonts);
         let mut missing = Vec::new();
         let mut substituted = Vec::new();
+        let mut icons = Vec::new();
         for e in &slide.elements {
             match e {
                 Element::Picture(p) => {
@@ -683,6 +790,7 @@ impl<'d> Renderer<'d> {
                             usage: &mut doc.usage,
                             missing: std::mem::take(&mut missing),
                             substituted: std::mem::take(&mut substituted),
+                            icons: std::mem::take(&mut icons),
                         };
                         let r = *s.text_rect.as_ref().unwrap_or(&s.rect);
                         if t.rotation.abs() > 0.01 {
@@ -708,6 +816,7 @@ impl<'d> Renderer<'d> {
                         }
                         missing = fset.missing;
                         substituted = fset.substituted;
+                        icons = fset.icons;
                     }
                     page.c.restore_state();
                 }
@@ -715,12 +824,19 @@ impl<'d> Renderer<'d> {
         }
         self.opts.fonts = font_files;
 
-        for (face, base) in substituted {
-            // Deck-wide, once per typeface: the same font is usually on every slide.
+        for f in substituted {
+            // Deck-wide: the same font is usually on every slide.
+            if !self.substituted.contains(&f) {
+                self.substituted.push(f);
+            }
+        }
+        for (face, n) in icons {
             let w = Warning {
-                slide: None,
+                slide: Some(slide.number),
                 message: format!(
-                    "font '{face}' is not available and was drawn with {base}; line breaks may differ (to embed it, register the font file with a preset other than light)"
+                    "icon font '{face}' is not available; {n} icon{} left blank (register the font file to draw {})",
+                    if n == 1 { "" } else { "s" },
+                    if n == 1 { "it" } else { "them" }
                 ),
             };
             if !self.warnings.contains(&w) {
@@ -1339,6 +1455,10 @@ fn layout_paragraph(p: &Paragraph, scale: f32, avail_first: f32, avail_rest: f32
             glyphs.push(None);
             continue;
         }
+        if let Some(g) = fonts.icon(r, ri) {
+            glyphs.push(Some(g));
+            continue;
+        }
         for ch in r.text.chars() {
             match ch {
                 '\n' | '\u{b}' | '\u{2028}' => glyphs.push(None),
@@ -1643,6 +1763,7 @@ mod tests {
             usage: &mut [],
             missing: Vec::new(),
             substituted: Vec::new(),
+            icons: Vec::new(),
         };
         assert_eq!(fonts.matching(&run("Montserrat Black", false, false)), Some(2));
         assert_eq!(fonts.matching(&run("Montserrat ExtraBold", false, false)), Some(1));
@@ -1664,12 +1785,50 @@ mod tests {
     }
 
     #[test]
+    fn missing_weights_are_reported_as_one_family() {
+        let faces: Vec<(String, &'static str)> = ["Montserrat", "Montserrat Black", "Montserrat Medium", "Inter"]
+            .iter()
+            .map(|f| (f.to_string(), "Helvetica"))
+            .collect();
+        let w = group_substitutions(&faces);
+        assert_eq!(w.len(), 2);
+        assert!(w[0].starts_with("font family 'Montserrat' is not available (weights: Regular, Medium, Black)"));
+        assert!(w[1].starts_with("font 'Inter' is not available and was drawn with Helvetica"));
+    }
+
+    #[test]
+    fn unregistered_icon_fonts_draw_no_ligature_names() {
+        let mut fonts = Fonts {
+            files: &[],
+            usage: &mut [],
+            missing: Vec::new(),
+            substituted: Vec::new(),
+            icons: Vec::new(),
+        };
+        let r = Run {
+            text: "play_circle_filled".into(),
+            ..run("Material Icons", false, false)
+        };
+        let g = fonts.icon(&r, 0).expect("an icon run");
+        assert_eq!(&g.code[..1], b" ");
+        assert_eq!(fonts.icons, vec![("Material Icons".to_string(), 1)]);
+        assert!(fonts.substituted.is_empty());
+        // Words in an icon font are not an icon name.
+        let words = Run {
+            text: "Watch the video".into(),
+            ..run("Material Icons", false, false)
+        };
+        assert!(fonts.icon(&words, 0).is_none());
+    }
+
+    #[test]
     fn unregistered_typefaces_are_reported_once() {
         let mut fonts = Fonts {
             files: &[],
             usage: &mut [],
             missing: Vec::new(),
             substituted: Vec::new(),
+            icons: Vec::new(),
         };
         for r in [
             run("Montserrat", false, false),
@@ -1691,6 +1850,7 @@ mod tests {
             usage: &mut usage,
             missing: Vec::new(),
             substituted: Vec::new(),
+            icons: Vec::new(),
         };
         fonts.glyph(&run("Montserrat", false, false), 0, '→');
         assert!(fonts.substituted.is_empty());
@@ -1710,6 +1870,7 @@ mod tests {
             usage: &mut usage,
             missing: Vec::new(),
             substituted: Vec::new(),
+            icons: Vec::new(),
         };
         // Greek in an unregistered typeface: the upright file wins over the
         // earlier italic one.
@@ -1762,6 +1923,7 @@ mod tests {
             usage: &mut [],
             missing: Vec::new(),
             substituted: Vec::new(),
+            icons: Vec::new(),
         };
         let lines = layout_paragraph(&p, 1.0, 60.0, 60.0, true, &mut fonts);
         assert_eq!(lines.len(), 2);

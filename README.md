@@ -220,6 +220,26 @@ const { manifest, report, stats } = convertFile("course.pptx", "out/course-1", {
 Servers should use `createPool` instead (worker threads with a memory cap,
 timeout and cancellation per job): see "Running in pods" above.
 
+### Storing the output
+
+Object stores and CDN upload services often accept only some extensions or
+folder names. Nothing in the output depends on its names:
+
+- `names` renames the files `convertFile` writes, or skips one with `false`:
+  ```ts
+  convertFile("course.pptx", "out/course-1", {
+    names: { manifest: "manifest.txt", report: false, deck: "deck.pdf" },
+  });
+  ```
+  Renaming the deck updates `pdf.file` in the manifest.
+- The viewer's `manifest` attribute can be any URL, whatever its extension
+  or content type: the body is parsed as JSON.
+- Fragment URLs are resolved relative to the manifest URL, so the folder can
+  have any name your store accepts (`course-1-slides/` rather than
+  `course-1.slides/`, say).
+- When the store cannot keep the names at all, a viewer `loader` maps each
+  file name to wherever it was stored.
+
 ```ts
 import { convert, convertStream, assemble, search, ready } from "slidepdf";
 
@@ -259,6 +279,12 @@ been tested yet.
 ```
 
 Keys: arrows / PageUp / PageDown / Space, Home, End, `F` for fullscreen.
+
+Thumbnails are drawn after the first slide is shown, two at a time, as they
+scroll into view; `thumbnails="eager"` draws them all up front and
+`thumbnails="off"` shows only the numbers. Fragment bytes are kept for the
+last 8 slides, so a thumbnail followed by a visit downloads once, also with a
+`loader` or uncacheable (signed, `no-store`) URLs.
 
 Files behind authentication, your own pdf.js, your own texts (set these
 properties from JavaScript, before or after `manifest`):
