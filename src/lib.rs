@@ -27,6 +27,7 @@ mod metrics;
 pub mod pdf;
 pub mod pptx;
 mod presets;
+mod smartart;
 mod xml;
 
 pub use fonts::FontFile;

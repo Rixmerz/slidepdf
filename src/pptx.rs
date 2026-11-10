@@ -11,6 +11,7 @@ use std::io::{Cursor, Read, Seek};
 
 use crate::ir::*;
 use crate::presets;
+use crate::smartart;
 use crate::xml::{self, Node};
 
 // ---------------------------------------------------------------- package
@@ -332,6 +333,18 @@ fn apply_mods(c: Rgb, n: &Node) -> Rgb {
     } else {
         to_rgb(r, g, b)
     }
+}
+
+/// `c` blended with white; `t` is the share of `c` kept (1.0 = unchanged).
+fn mix_with_white(c: Rgb, t: f32) -> Rgb {
+    let (r, g, b) = c.floats();
+    to_rgb(r * t + 1.0 - t, g * t + 1.0 - t, b * t + 1.0 - t)
+}
+
+/// Relative brightness 0..1 (Rec. 601 weights).
+fn luminance(c: Rgb) -> f32 {
+    let (r, g, b) = c.floats();
+    0.299 * r + 0.587 * g + 0.114 * b
 }
 
 fn to_rgb(r: f32, g: f32, b: f32) -> Rgb {
@@ -2221,11 +2234,18 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
     }
 
     /// SmartArt: PowerPoint saves a pre-laid-out copy (`diagrams/drawingN.xml`)
-    /// made of ordinary shapes, positioned relative to the graphic frame.
+    /// of every diagram; other writers keep only the data model, which is laid
+    /// out here. False when neither is available.
     fn smartart(&mut self, data: &Node, part: &Part, xf: Xform, frame: Rect) -> bool {
         if self.in_diagram {
             return false;
         }
+        self.smartart_drawing(data, part, xf, frame) || self.smartart_laid_out(data, part, xf, frame)
+    }
+
+    /// The saved drawing (`diagrams/drawingN.xml`): ordinary shapes,
+    /// positioned relative to the graphic frame.
+    fn smartart_drawing(&mut self, data: &Node, part: &Part, xf: Xform, frame: Rect) -> bool {
         // data part -> dataModelExt relId -> drawing (a relationship of the slide).
         let dm = data
             .child("relIds")
@@ -2247,6 +2267,212 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         self.walk(&tree.children, &drawing, xf.shifted(frame.x, frame.y), false);
         self.in_diagram = false;
         true
+    }
+
+    /// A diagram with no saved drawing, laid out from its data model by
+    /// [`smartart`]: a layout family picked from the layout's name, the
+    /// accent colors of the diagram's color part, and each node's text fitted
+    /// to its box. False when the frame has no readable data part.
+    fn smartart_laid_out(&mut self, data: &Node, part: &Part, xf: Xform, frame: Rect) -> bool {
+        let rel = |key: &str| {
+            data.child("relIds")
+                .and_then(|r| r.attr(key))
+                .and_then(|id| part.rels.get(id))
+                .map(|r| r.target.clone())
+        };
+        let Some(root) = rel("r:dm").and_then(|p| self.pkg.xml(&p)) else {
+            return false;
+        };
+        let model = smartart::Model::parse(&root);
+        if model.roots.is_empty() {
+            // An empty diagram has nothing to lose.
+            return true;
+        }
+        let layout_id = match &model.layout_id {
+            Some(id) => id.clone(),
+            None => rel("r:lo")
+                .and_then(|p| self.pkg.xml(&p))
+                .and_then(|l| l.attr("uniqueId").map(String::from))
+                .unwrap_or_default(),
+        };
+        let colors = self.smartart_colors(rel("r:cs"));
+        let pieces = smartart::layout(&model, smartart::family_of(&layout_id), frame.w, frame.h);
+        let dark = self.theme.colors.get("dk1").copied().unwrap_or(Rgb::BLACK);
+        let pts: &[Node] = root.child("ptLst").map(|l| l.children.as_slice()).unwrap_or(&[]);
+        let to_slide = |r: Rect| {
+            xf.rect(Rect {
+                x: frame.x + r.x,
+                y: frame.y + r.y,
+                ..r
+            })
+        };
+
+        let first = self.elements.len();
+        // (element index, text, author chose the size, role) of every label.
+        let mut texts: Vec<(usize, TextBody, bool, smartart::Role)> = Vec::new();
+        for piece in &pieces {
+            let base = colors[piece.color % colors.len()];
+            let (fill, stroke) = match piece.role {
+                smartart::Role::Primary => (
+                    Some(Fill::Solid(base)),
+                    Some(Stroke {
+                        color: Rgb::WHITE,
+                        width: 12700.0,
+                    }),
+                ),
+                smartart::Role::Secondary => (
+                    Some(Fill::Solid(mix_with_white(base, 0.2))),
+                    Some(Stroke {
+                        color: base,
+                        width: 12700.0,
+                    }),
+                ),
+                smartart::Role::Arrow => (Some(Fill::Solid(mix_with_white(base, 0.6))), None),
+                smartart::Role::Link => (
+                    None,
+                    Some(Stroke {
+                        color: colors[0],
+                        width: 12700.0,
+                    }),
+                ),
+            };
+            let mut text_rect = None;
+            if let Some(label) = &piece.label {
+                let at = to_slide(label.rect);
+                text_rect = Some(at);
+                // Light text on a dark accent, dark text on a pale one.
+                let on = match piece.role {
+                    smartart::Role::Primary if luminance(base) < 0.6 => Rgb::WHITE,
+                    smartart::Role::Primary => dark,
+                    _ => dark,
+                };
+                if let Some((body, explicit)) = self.smartart_text(pts, &model, label, on, at) {
+                    texts.push((self.elements.len(), body, explicit, piece.role));
+                }
+            }
+            self.elements.push(Element::Shape(Shape {
+                rect: to_slide(piece.rect),
+                rotation: piece.rotation,
+                flip_h: piece.flip_h,
+                flip_v: piece.flip_v,
+                geometry: piece.geometry.clone(),
+                fill,
+                stroke,
+                text: None,
+                is_title: false,
+                text_rect,
+            }));
+        }
+        // One size for all the nodes of a kind, as PowerPoint does; text with
+        // a size of its own only shrinks to fit.
+        for role in [smartart::Role::Primary, smartart::Role::Secondary] {
+            let fitted: Vec<(usize, f32, bool)> = texts
+                .iter()
+                .filter(|t| t.3 == role)
+                .map(|(i, body, explicit, _)| {
+                    let Some(Element::Shape(s)) = self.elements.get(*i) else {
+                        return (*i, 1.0, *explicit);
+                    };
+                    let at = s.text_rect.unwrap_or(s.rect);
+                    let size = body
+                        .paragraphs
+                        .iter()
+                        .flat_map(|p| p.runs.iter().map(|r| r.size))
+                        .fold(0.0, f32::max);
+                    (
+                        *i,
+                        smartart::fit_scale(body, at.w, at.h, smartart::max_scale(size, *explicit)),
+                        *explicit,
+                    )
+                })
+                .collect();
+            let shared = fitted.iter().filter(|f| !f.2).map(|f| f.1).fold(f32::INFINITY, f32::min);
+            for (i, own, explicit) in fitted {
+                if let Some(t) = texts.iter_mut().find(|t| t.0 == i) {
+                    t.1.font_scale = if explicit { own } else { shared };
+                }
+            }
+        }
+        for (i, mut body, ..) in texts {
+            smartart::finish_bullets(&mut body);
+            if let Some(Element::Shape(s)) = self.elements.get_mut(i) {
+                s.text = Some(body);
+            }
+        }
+        xf.turn_elements(&mut self.elements[first..]);
+        self.warn("SmartArt laid out by slidepdf, not PowerPoint");
+        if model.truncated {
+            self.warn(format!(
+                "SmartArt has more than {} nodes or {} levels; the rest was left out",
+                smartart::MAX_NODES,
+                smartart::MAX_DEPTH
+            ));
+        }
+        true
+    }
+
+    /// The fill colors of a diagram's color part (`styleLbl node1`), or the
+    /// theme's first accent.
+    fn smartart_colors(&mut self, part: Option<String>) -> Vec<Rgb> {
+        let cc = self.cc();
+        let listed = part.and_then(|p| self.pkg.xml(&p)).and_then(|root| {
+            let label = ["node1", "node0"]
+                .iter()
+                .find_map(|n| root.children_named("styleLbl").find(|s| s.attr("name") == Some(n)))?;
+            let colors: Vec<Rgb> = label.child("fillClrLst")?.children.iter().filter_map(|c| cc.color(c)).collect();
+            (!colors.is_empty()).then_some(colors)
+        });
+        listed.unwrap_or_else(|| vec![self.theme.colors.get("accent1").copied().unwrap_or(Rgb(68, 114, 196))])
+    }
+
+    /// The text of a label: the heading centred, the bullets as a list,
+    /// anchored in the middle of `at`. The size is set by the caller.
+    fn smartart_text(
+        &mut self,
+        pts: &[Node],
+        model: &smartart::Model,
+        label: &smartart::Label,
+        color: Rgb,
+        at: Rect,
+    ) -> Option<(TextBody, bool)> {
+        let mut merged: Option<TextBody> = None;
+        let mut explicit = false;
+        let headings = label.heading.iter().count();
+        for (k, &n) in label.heading.iter().chain(&label.bullets).enumerate() {
+            let Some(t) = pts.get(model.nodes[n].pt).and_then(|p| p.child("t")) else {
+                continue;
+            };
+            let Some(mut body) = self.text_body(t, None, None, None, Some(color)) else {
+                continue;
+            };
+            explicit |= smartart::has_explicit_size(t);
+            for p in &mut body.paragraphs {
+                if k < headings {
+                    p.align = Align::Center;
+                } else {
+                    p.align = Align::Left;
+                    if p.runs.iter().any(|r| !r.text.trim().is_empty()) {
+                        p.bullet = Some(Bullet {
+                            text: "\u{2022}".into(),
+                            color: None,
+                            scale: 1.0,
+                        });
+                    }
+                }
+            }
+            match &mut merged {
+                None => merged = Some(body),
+                Some(m) => m.paragraphs.extend(body.paragraphs),
+            }
+        }
+        let mut body = merged?;
+        let inset = (at.w.min(at.h) * 0.06).clamp(20_000.0, 120_000.0);
+        body.insets = [inset; 4];
+        body.anchor = Anchor::Middle;
+        body.wrap = true;
+        body.rotation = 0.0;
+        body.line_reduction = 0.0;
+        Some((body, explicit))
     }
 
     /// Tables become one rectangle shape per cell. Explicit cell fills win;
