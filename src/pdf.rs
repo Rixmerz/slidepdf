@@ -314,6 +314,16 @@ fn char_width(font: FontKey, code: u8) -> f32 {
     }
 }
 
+/// The advance of `c` in `r`'s face, in ems, as `Fonts::glyph` measures it
+/// when no font file is registered: the built-in face the run maps to, with
+/// the real typeface's widths where they ship, and `?` for what WinAnsi lacks.
+/// Layout done before rendering (SmartArt text fitting) measures with this.
+pub(crate) fn builtin_advance(r: &Run, c: char) -> f32 {
+    let key = FontKey::of(r);
+    let code = winansi(c).unwrap_or(b'?');
+    metric_width(&r.face, key, code).unwrap_or_else(|| char_width(key, code))
+}
+
 /// Where the renderer gets image bytes from: called with a package path,
 /// returns the bytes. Images are fetched only when drawn and dropped after
 /// being prepared, so the deck's media never sits in memory all at once.

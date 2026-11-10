@@ -9,9 +9,12 @@ const LAID_OUT: &str = "SmartArt laid out by slidepdf, not PowerPoint";
 const SKIPPED: &str = "SmartArt skipped (no saved drawing)";
 const FRAME: (i64, i64, i64, i64) = (1_000_000, 1_000_000, 6_000_000, 4_000_000);
 
+/// Top-level nodes, each with the texts of its children.
+type Nodes<'a> = &'a [(&'a str, &'a [&'a str])];
+
 /// A data model of top-level nodes, each with optional children. `layout` is
 /// the document node's `loTypeId`.
-fn data_model(layout: &str, nodes: &[(&str, &[&str])]) -> String {
+fn data_model(layout: &str, nodes: Nodes) -> String {
     let mut pts = format!(r#"<dgm:pt modelId="doc" type="doc"><dgm:prSet loTypeId="{layout}"/></dgm:pt>"#);
     let mut cxns = String::new();
     let mut id = 0;
@@ -46,11 +49,12 @@ fn frame_xml() -> String {
     )
 }
 
-/// The frame inside a group turned `rot` (60000ths of a degree) about its centre.
-fn turned_group(rot: i64) -> String {
+/// The frame inside a group whose `xfrm` carries `attrs` (`rot`, `flipH`...);
+/// the group's child space is its own rect, so only the turn or mirror shows.
+fn grouped(attrs: &str) -> String {
     let (x, y, w, h) = FRAME;
     format!(
-        r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="9" name="g"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm rot="{rot}"><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/><a:chOff x="{x}" y="{y}"/><a:chExt cx="{w}" cy="{h}"/></a:xfrm></p:grpSpPr>{}</p:grpSp>"#,
+        r#"<p:grpSp><p:nvGrpSpPr><p:cNvPr id="9" name="g"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr><p:grpSpPr><a:xfrm {attrs}><a:off x="{x}" y="{y}"/><a:ext cx="{w}" cy="{h}"/><a:chOff x="{x}" y="{y}"/><a:chExt cx="{w}" cy="{h}"/></a:xfrm></p:grpSpPr>{}</p:grpSp>"#,
         frame_xml()
     )
 }
@@ -281,7 +285,7 @@ fn text_is_fitted_and_shared_so_longer_text_shrinks_every_node() {
 
 #[test]
 fn every_family_is_laid_out_with_its_text() {
-    let nodes: &[(&str, &[&str])] = &[("Alpha", &["a1", "a2"]), ("Beta", &["b1"]), ("Gamma", &[])];
+    let nodes: Nodes = &[("Alpha", &["a1", "a2"]), ("Beta", &["b1"]), ("Gamma", &[])];
     for layout in [
         "default",
         "vList2",
@@ -336,7 +340,7 @@ fn a_laid_out_diagram_turns_with_its_rotated_group() {
     let data = data_model("urn:x/layout/process1", &[("a", &[]), ("b", &[]), ("c", &[])]);
     let still = parse(&plain(&data));
     let turned = parse(&deck(&Parts {
-        slide_body: turned_group(5_400_000),
+        slide_body: grouped(r#"rot="5400000""#),
         data: Some(&data),
         colors: None,
         drawing: None,
@@ -366,6 +370,55 @@ fn a_laid_out_diagram_turns_with_its_rotated_group() {
             // The offset from the shape's centre is turned by the shape's own rotation at draw
             // time, so the stored box keeps the same offset.
             assert!(((tac.0 - got.0) - dx).abs() < 2.0 && ((tac.1 - got.1) - dy).abs() < 2.0);
+        }
+    }
+}
+
+#[test]
+fn a_laid_out_diagram_mirrors_with_its_flipped_group() {
+    // Arrows (cycle) and connector lines (radial) are the pieces that carry
+    // a rotation or a flip of their own.
+    let rings: [(&str, Nodes); 2] = [
+        ("cycle2", &[("a", &[]), ("b", &[]), ("c", &[]), ("d", &[])]),
+        ("radial3", &[("hub", &["a", "b", "c"])]),
+    ];
+    for (layout, nodes) in rings {
+        let data = data_model(&format!("urn:x/layout/{layout}"), nodes);
+        let still = parse(&plain(&data));
+        let mirrored = parse(&deck(&Parts {
+            slide_body: grouped(r#"flipH="1""#),
+            data: Some(&data),
+            colors: None,
+            drawing: None,
+        }));
+        let (before, after) = (shapes(&still), shapes(&mirrored));
+        assert_eq!(before.len(), after.len(), "{layout}");
+        let (x, _, w, _) = FRAME;
+        let px = (x + w / 2) as f32;
+        let centre = |s: &Shape| (s.rect.x + s.rect.w / 2.0, s.rect.y + s.rect.h / 2.0);
+        for (b, a) in before.iter().zip(&after) {
+            let (bx, by) = centre(b);
+            let got = centre(a);
+            assert!(
+                (got.0 - (2.0 * px - bx)).abs() < 2.0 && (got.1 - by).abs() < 2.0,
+                "{layout}: {got:?}"
+            );
+            assert_eq!(a.flip_h, !b.flip_h, "{layout}: every piece is mirrored");
+            assert_eq!(a.flip_v, b.flip_v, "{layout}");
+            assert!(
+                ((a.rotation + b.rotation).rem_euclid(360.0)).min(360.0 - (a.rotation + b.rotation).rem_euclid(360.0)) < 0.01,
+                "{layout}: a mirrored group reverses rotation: {} -> {}",
+                b.rotation,
+                a.rotation
+            );
+        }
+        // The pieces that carry a turn or a flip of their own are really there.
+        match layout {
+            "cycle2" => assert!(before.iter().any(|s| s.rotation != 0.0), "cycle arrows are turned"),
+            _ => assert!(
+                before.iter().any(|s| s.flip_h) && before.iter().any(|s| !s.flip_h),
+                "lines run both ways"
+            ),
         }
     }
 }

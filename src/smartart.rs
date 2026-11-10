@@ -12,8 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{Family as FontFamily, Geometry, Paragraph, PathCmd, Rect, Run, TextBody, EMU_PER_PT};
-use crate::metrics;
+use crate::ir::{Geometry, Paragraph, PathCmd, Rect, TextBody, EMU_PER_PT};
 use crate::xml::Node;
 
 /// Nodes laid out per diagram, and how deep the tree may go. A hostile data
@@ -735,38 +734,6 @@ fn hierarchy(model: &Model, w: f32, h: f32) -> Vec<Piece> {
 const MIN_PT: f32 = 5.0;
 const MAX_PT: f32 = 65.0;
 
-/// Width of `c` in `r`'s font, in ems; the same tables the PDF writer wraps
-/// lines with, so the fit agrees with the page.
-fn advance(r: &Run, c: char) -> f32 {
-    let Some(code) = crate::pdf::winansi(c) else { return 0.9 };
-    if code < 32 {
-        return 0.0;
-    }
-    let i = (code - 32) as usize;
-    let table: &[u16; 224] = match r.family {
-        FontFamily::Mono => return 0.6,
-        FontFamily::Sans if r.face.to_ascii_lowercase().starts_with("calibri") => match (r.bold, r.italic) {
-            (false, false) => &metrics::CALIBRI,
-            (true, false) => &metrics::CALIBRI_BOLD,
-            (false, true) => &metrics::CALIBRI_ITALIC,
-            (true, true) => &metrics::CALIBRI_BOLD_ITALIC,
-        },
-        FontFamily::Sans => match (r.bold, r.italic) {
-            (false, false) => &metrics::HELVETICA,
-            (true, false) => &metrics::HELVETICA_BOLD,
-            (false, true) => &metrics::HELVETICA_OBLIQUE,
-            (true, true) => &metrics::HELVETICA_BOLD_OBLIQUE,
-        },
-        FontFamily::Serif => match (r.bold, r.italic) {
-            (false, false) => &metrics::TIMES_ROMAN,
-            (true, false) => &metrics::TIMES_BOLD,
-            (false, true) => &metrics::TIMES_ITALIC,
-            (true, true) => &metrics::TIMES_BOLD_ITALIC,
-        },
-    };
-    table[i] as f32 / 1000.0
-}
-
 /// Hanging indent of a bulleted paragraph, in ems of its first run: the
 /// bullet and the gap after it grow with the text.
 const BULLET_EM: f32 = 0.9;
@@ -870,9 +837,9 @@ fn text_height(body: &TextBody, avail_w: f32, scale: f32) -> (f32, bool) {
                     '\n' | '\u{b}' | '\u{2028}' => w.new_line(),
                     ' ' => {
                         w.end_word();
-                        w.space = advance(r, ' ') * size;
+                        w.space = crate::pdf::builtin_advance(r, ' ') * size;
                     }
-                    _ => w.word_w += advance(r, c) * size,
+                    _ => w.word_w += crate::pdf::builtin_advance(r, c) * size,
                 }
             }
         }
@@ -944,7 +911,7 @@ pub fn max_scale(base: f32, explicit: bool) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::{Align, Anchor, Rgb};
+    use crate::ir::{Align, Anchor, Family as FontFamily, Rgb, Run};
     use crate::xml;
 
     const W: f32 = 6_096_000.0;
