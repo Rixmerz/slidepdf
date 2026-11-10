@@ -319,10 +319,12 @@ vertical and rotated text); Calibri text is laid out with Calibri's real
 metrics (from the metric-compatible Carlito) so lines break where PowerPoint
 breaks them; theme colors with luminance, hue and saturation modifiers;
 solid, translucent, linear and radial gradient, and picture fills, including
-theme fill styles; about 60 preset shapes and custom geometry; rotation and
-flips; groups; pictures (JPEG, PNG and GIF with transparency, cropping);
+theme fill styles; the whole DrawingML preset shape catalogue (187 shapes)
+and custom geometry; rotation and flips; groups, including rotated and flipped ones; pictures (JPEG, PNG and GIF with transparency, cropping);
 tables with the styles defined in the deck; backgrounds; slide numbers;
-SmartArt (from the drawing PowerPoint saves with it); charts (columns, bars,
+SmartArt (from the drawing PowerPoint saves with it, or laid out by slidepdf
+from the data model when that drawing is missing: lists, process, cycle,
+radial, hierarchy and matrix layouts, reported as such); charts (columns, bars,
 lines, areas, pies, doughnuts and scatter, redrawn from the data cached in the
 deck; 3D charts are drawn flat); EMF and WMF pictures as vector shapes, text and
 embedded bitmaps (no clipping regions; text in non-Latin code pages may be
@@ -331,8 +333,7 @@ objects (Excel, Word...); and any content wrapped in `mc:AlternateContent`
 with a fallback picture (equations, some icons). Hidden shapes are skipped.
 
 Not supported yet (reported per slide): radar, bubble, stock and surface
-charts (drawn as line charts), SmartArt saved without its
-drawing, SVG and TIFF images, built-in Office table styles that the deck
+charts (drawn as line charts), SVG and TIFF images, built-in Office table styles that the deck
 does not define (a default look is used), shadows
 and effects, animations and transitions. Text layout is close to PowerPoint
 but not identical, since fonts differ unless the real ones are registered.
