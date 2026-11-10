@@ -77,6 +77,16 @@ impl<R: Read + Seek> Package<R> {
         Some(buf)
     }
 
+    /// The first part (shortest name, then alphabetical) whose path starts
+    /// with `prefix` and ends with `suffix`.
+    fn first_part(&self, prefix: &str, suffix: &str) -> Option<String> {
+        self.zip
+            .file_names()
+            .filter(|n| n.starts_with(prefix) && n.ends_with(suffix))
+            .min_by_key(|n| (n.len(), *n))
+            .map(String::from)
+    }
+
     fn xml(&mut self, path: &str) -> Option<Node> {
         let bytes = self.read(path)?;
         xml::parse(&bytes).ok()
@@ -114,6 +124,11 @@ impl<R: Read + Seek> Package<R> {
         }
         out
     }
+}
+
+/// Pictures the PDF writer can embed, by the lower-cased part name.
+fn is_raster(lower_name: &str) -> bool {
+    [".jpg", ".jpeg", ".png", ".gif"].iter().any(|e| lower_name.ends_with(e))
 }
 
 fn resolve_path(base_dir: &str, target: &str) -> String {
@@ -1252,7 +1267,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
     fn media(&mut self, part: &Part, rid: &str) -> Option<String> {
         let target = part.rels.get(rid)?.target.clone();
         let lower = target.to_ascii_lowercase();
-        if !(lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".png") || lower.ends_with(".gif")) {
+        if !is_raster(&lower) {
             let ext = lower.rsplit('.').next().unwrap_or("?").to_string();
             self.warn(format!("image format .{ext} is not supported yet ({target}), skipped"));
             return None;
@@ -2089,29 +2104,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             self.table(tbl, part, xf.rect(x.rect));
             xf.turn_elements(&mut self.elements[first..]);
         } else if uri.ends_with("/ole") {
-            // Embedded documents (Excel, Word, think-cell...) carry a preview
-            // picture; draw it in the frame.
-            let pic = data.find("pic");
-            let rid = pic.and_then(|p| p.path(&["blipFill", "blip"])).and_then(|b| b.attr("embed"));
-            match (rid, n.child("xfrm").and_then(parse_xfrm)) {
-                (Some(rid), Some(x)) => {
-                    if self.metafile(part, rid, x.rect, xf) {
-                        return;
-                    }
-                    let placed = xf.place(x.rect, x.rot, false, false);
-                    if let Some(media) = self.media(part, rid) {
-                        self.elements.push(Element::Picture(Picture {
-                            rect: placed.rect,
-                            rotation: placed.rotation,
-                            media,
-                            crop: [0.0; 4],
-                            flip_h: placed.flip_h,
-                            flip_v: placed.flip_v,
-                        }));
-                    }
-                }
-                _ => self.warn("embedded object skipped (no preview picture)"),
-            }
+            self.ole_object(n, data, part, xf);
         } else if uri.ends_with("/chart") {
             let Some(x) = n.child("xfrm").and_then(parse_xfrm) else { return };
             let first = self.elements.len();
@@ -2128,6 +2121,166 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         } else {
             self.warn(format!("graphic frame '{uri}' skipped"));
         }
+    }
+
+    /// An embedded document (Excel, Word, think-cell...). Most carry a preview
+    /// picture, which is drawn in the frame. Without one, the best available
+    /// stand-in: the embedded part itself when it is a picture, the chart
+    /// inside an embedded workbook, or a labelled placeholder box.
+    fn ole_object(&mut self, frame: &Node, data: &Node, part: &Part, xf: Xform) {
+        let Some(x) = frame.child("xfrm").and_then(parse_xfrm) else {
+            self.warn("embedded object skipped (no position)");
+            return;
+        };
+        let preview = data
+            .find("pic")
+            .and_then(|p| p.path(&["blipFill", "blip"]))
+            .and_then(|b| b.attr("embed"));
+        if let Some(rid) = preview {
+            if self.metafile(part, rid, x.rect, xf) {
+                return;
+            }
+            self.place_picture(part, rid, &x, xf);
+            return;
+        }
+        let ole = data.find("oleObj");
+        let attr = |key: &str| ole.and_then(|o| o.attr(key)).map(str::trim).unwrap_or("");
+        let (prog_id, name) = (attr("progId"), attr("name"));
+        if let Some(rid) = ole.and_then(|o| o.attr("r:id")) {
+            if self.ole_picture(part, rid, &x, xf) {
+                return;
+            }
+            if prog_id.starts_with("Excel.") && self.ole_chart(part, rid, &x, xf) {
+                return;
+            }
+        }
+        // The object's own name reads best on the slide; the progId (which
+        // may be empty, as in "Photo Editor Photo") names the kind in the warning.
+        let label = [name, prog_id].into_iter().find(|s| !s.is_empty()).unwrap_or("Embedded object");
+        let kind = [prog_id, name].into_iter().find(|s| !s.is_empty()).unwrap_or("object");
+        self.warn(format!("embedded {kind} drawn as a placeholder"));
+        self.ole_placeholder(label, &x, xf);
+    }
+
+    /// Draws the raster image `rid` points at in the frame.
+    fn place_picture(&mut self, part: &Part, rid: &str, x: &RawXfrm, xf: Xform) {
+        let placed = xf.place(x.rect, x.rot, false, false);
+        if let Some(media) = self.media(part, rid) {
+            self.elements.push(Element::Picture(Picture {
+                rect: placed.rect,
+                rotation: placed.rotation,
+                media,
+                crop: [0.0; 4],
+                flip_h: placed.flip_h,
+                flip_v: placed.flip_v,
+            }));
+        }
+    }
+
+    /// The embedded part is itself a picture (EMF, WMF, PNG, JPEG, GIF).
+    /// ponytail: a PDF is not drawn; there is no rasterizer, so it gets the placeholder.
+    fn ole_picture(&mut self, part: &Part, rid: &str, x: &RawXfrm, xf: Xform) -> bool {
+        let Some(target) = part.rels.get(rid).map(|r| r.target.to_ascii_lowercase()) else {
+            return false;
+        };
+        if target.ends_with(".emf") || target.ends_with(".wmf") {
+            // `metafile` also answers true when it had to skip the picture.
+            let before = self.elements.len();
+            return self.metafile(part, rid, x.rect, xf) && self.elements.len() > before;
+        }
+        if !is_raster(&target) {
+            return false;
+        }
+        let before = self.elements.len();
+        self.place_picture(part, rid, x, xf);
+        self.elements.len() > before
+    }
+
+    /// The first chart of an embedded workbook (`.xlsx`), redrawn from the
+    /// values cached in its chart part. The workbook is read once, into memory
+    /// no longer than this call, and only that one part is inflated.
+    fn ole_chart(&mut self, part: &Part, rid: &str, x: &RawXfrm, xf: Xform) -> bool {
+        let Some(target) = part.rels.get(rid).map(|r| r.target.clone()) else {
+            return false;
+        };
+        let lower = target.to_ascii_lowercase();
+        if !(lower.ends_with(".xlsx") || lower.ends_with(".xlsm")) {
+            return false;
+        }
+        let root = {
+            let Some(bytes) = self.pkg.read_media(&target) else { return false };
+            let Ok(mut workbook) = Package::from_bytes(&bytes) else {
+                return false;
+            };
+            let Some(chart) = workbook.first_part("xl/charts/chart", ".xml") else {
+                return false;
+            };
+            workbook.xml(&chart)
+        };
+        let Some(root) = root else { return false };
+        let first = self.elements.len();
+        // The chart's own relationships live in the workbook; none are followed.
+        if !self.draw_chart(&root, HashMap::new(), xf.rect(x.rect)) {
+            return false;
+        }
+        xf.turn_elements(&mut self.elements[first..]);
+        true
+    }
+
+    /// A light grey box with a thin border and `label` centred in it, so the
+    /// slide keeps the object's place in its layout.
+    fn ole_placeholder(&mut self, label: &str, x: &RawXfrm, xf: Xform) {
+        let placed = xf.place(x.rect, x.rot, false, false);
+        const SIZE: f32 = 12.0;
+        let face = self.theme.minor.clone();
+        let mut body = TextBody {
+            insets: [91440.0, 45720.0, 91440.0, 45720.0],
+            rotation: 0.0,
+            anchor: Anchor::Middle,
+            wrap: true,
+            font_scale: 1.0,
+            line_reduction: 0.0,
+            paragraphs: vec![Paragraph {
+                align: Align::Center,
+                margin_left: 0.0,
+                indent: 0.0,
+                bullet: None,
+                line_spacing: 1.0,
+                line_spacing_pt: None,
+                space_before: 0.0,
+                space_after: 0.0,
+                runs: vec![Run {
+                    text: label.to_string(),
+                    size: SIZE,
+                    bold: false,
+                    italic: false,
+                    underline: false,
+                    color: Rgb(89, 89, 89),
+                    family: family_of(&face),
+                    face,
+                    line_break: false,
+                }],
+                end_size: SIZE,
+            }],
+        };
+        body.font_scale = smartart::fit_scale(&body, placed.rect.w, placed.rect.h, 1.0);
+        self.elements.push(Element::Shape(Shape {
+            rect: placed.rect,
+            rotation: placed.rotation,
+            flip_h: placed.flip_h,
+            flip_v: placed.flip_v,
+            geometry: Geometry::Rect,
+            // Not fully opaque: an object the size of the slide must not wipe
+            // out the background and whatever sits behind it.
+            fill: Some(Fill::Translucent(Rgb(242, 242, 242), 0.8)),
+            stroke: Some(Stroke {
+                color: Rgb(166, 166, 166),
+                width: 9525.0,
+            }),
+            text: Some(body),
+            is_title: false,
+            text_rect: None,
+        }));
     }
 
     /// EMF/WMF pictures are replayed into vector shapes. Returns true when
@@ -2192,13 +2345,24 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
             return false;
         };
         let Some(root) = self.pkg.xml(&path) else { return false };
+        let rels = if root.child("spPr").is_some() {
+            self.pkg.rels(&path)
+        } else {
+            HashMap::new()
+        };
+        self.draw_chart(&root, rels, frame)
+    }
+
+    /// Draws a parsed chart part into `frame`. `rels` are the chart part's
+    /// own relationships (for a picture background). False, with nothing
+    /// drawn, when the part holds no chart we can read.
+    fn draw_chart(&mut self, root: &Node, rels: HashMap<String, Rel>, frame: Rect) -> bool {
         let cc = self.cc();
-        let Some(chart) = crate::chart::parse(&root, &|fill: &Node| cc.color_in(fill)) else {
+        let Some(chart) = crate::chart::parse(root, &|fill: &Node| cc.color_in(fill)) else {
             return false;
         };
         // The chart's own background (solid, gradient, picture or texture).
         if let Some(sp) = root.child("spPr") {
-            let rels = self.pkg.rels(&path);
             let chart_part = Part {
                 root: Node::default(),
                 rels,
