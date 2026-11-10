@@ -2123,7 +2123,7 @@ impl<'p, 'z, 'c, R: Read + Seek> SlideBuilder<'p, 'z, 'c, R> {
         } else if uri.ends_with("/diagram") {
             let Some(x) = n.child("xfrm").and_then(parse_xfrm) else { return };
             if !self.smartart(data, part, xf, x.rect) {
-                self.warn("SmartArt skipped (no saved drawing)");
+                self.warn("SmartArt skipped (no saved drawing and no readable data model)");
             }
         } else {
             self.warn(format!("graphic frame '{uri}' skipped"));

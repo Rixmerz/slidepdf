@@ -88,9 +88,10 @@ impl Model {
         let doc = pts.iter().position(|p| p.name == "pt" && kind(p) == "doc");
         let top: Vec<usize> = match doc {
             Some(d) => kids.get(&d).map(|v| v.iter().map(|k| k.1).collect()).unwrap_or_default(),
-            None => (0..pts.len())
-                .filter(|i| by_id.values().any(|v| v == i) && !has_parent.contains(i))
-                .collect(),
+            None => {
+                let is_node: HashSet<usize> = by_id.values().copied().collect();
+                (0..pts.len()).filter(|i| is_node.contains(i) && !has_parent.contains(i)).collect()
+            }
         };
 
         let mut model = Model {
@@ -1010,6 +1011,32 @@ mod tests {
         let m = model(&rows, "");
         assert!(m.truncated);
         assert_eq!(m.nodes.len(), MAX_NODES);
+    }
+
+    #[test]
+    fn a_model_without_a_document_node_takes_the_parentless_nodes_as_roots() {
+        let xml = r#"<dgm:dataModel xmlns:dgm="d" xmlns:a="a"><dgm:ptLst>
+            <dgm:pt modelId="x"/><dgm:pt modelId="y"/><dgm:pt modelId="z"/></dgm:ptLst>
+            <dgm:cxnLst><dgm:cxn srcId="x" destId="y" srcOrd="0"/></dgm:cxnLst></dgm:dataModel>"#;
+        let m = Model::parse(&xml::parse(xml.as_bytes()).unwrap());
+        let roots: Vec<usize> = m.roots.iter().map(|&r| m.nodes[r].pt).collect();
+        assert_eq!(roots, [0, 2], "x and z have no parent; y hangs under x");
+        assert_eq!(m.nodes[m.roots[0]].children.len(), 1);
+    }
+
+    #[test]
+    fn a_huge_model_without_a_document_node_is_read_in_linear_time() {
+        // A hostile data part can hold hundreds of thousands of points; finding the
+        // roots must not compare every point with every other one.
+        let n = 150_000;
+        let pts: String = (0..n).map(|i| format!(r#"<dgm:pt modelId="n{i}"/>"#)).collect();
+        let xml = format!(r#"<dgm:dataModel xmlns:dgm="d" xmlns:a="a"><dgm:ptLst>{pts}</dgm:ptLst></dgm:dataModel>"#);
+        let doc = xml::parse(xml.as_bytes()).unwrap();
+        let started = std::time::Instant::now();
+        let m = Model::parse(&doc);
+        assert!(started.elapsed().as_secs() < 3, "took {:?}", started.elapsed());
+        assert_eq!(m.nodes.len(), MAX_NODES);
+        assert!(m.truncated);
     }
 
     #[test]

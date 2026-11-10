@@ -6,7 +6,7 @@ use std::io::{Cursor, Read, Write};
 
 const DECK: &[u8] = include_bytes!("fixtures/deck.pptx");
 const LAID_OUT: &str = "SmartArt laid out by slidepdf, not PowerPoint";
-const SKIPPED: &str = "SmartArt skipped (no saved drawing)";
+const SKIPPED: &str = "SmartArt skipped (no saved drawing and no readable data model)";
 const FRAME: (i64, i64, i64, i64) = (1_000_000, 1_000_000, 6_000_000, 4_000_000);
 
 /// Top-level nodes, each with the texts of its children.
