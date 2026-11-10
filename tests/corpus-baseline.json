@@ -16,6 +16,7 @@
   "lo/sd/qa/unit/data/n819614.pptx": {"converted": true, "slides": 1, "warnings": 0, "kinds": []},
   "lo/sd/qa/unit/data/n820786.pptx": {"converted": true, "slides": 1, "warnings": 0, "kinds": []},
   "lo/sd/qa/unit/data/n902652.pptx": {"converted": true, "slides": 1, "warnings": 0, "kinds": []},
+  "lo/sd/qa/unit/data/ppt/placeholder-priority.pptx": {"converted": true, "slides": 1, "warnings": 1, "kinds": ["font '_' is not available and was drawn with Helvetica; line breaks may differ (to embed it, register the font file with a preset other than light)"]},
   "lo/sd/qa/unit/data/pptx/3columns.pptx": {"converted": true, "slides": 1, "warnings": 0, "kinds": []},
   "lo/sd/qa/unit/data/pptx/Bar_List.pptx": {"converted": true, "slides": 1, "warnings": 0, "kinds": []},
   "lo/sd/qa/unit/data/pptx/Bullet_Timeline_one_Event.pptx": {"converted": true, "slides": 1, "warnings": 0, "kinds": []},
