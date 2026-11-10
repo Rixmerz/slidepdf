@@ -6,6 +6,58 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-10
+
+Fidelity release: the shapes, groups and diagrams that were still simplified
+are drawn, with a real-deck regression test behind them.
+
+### Added
+
+- Rotated and flipped groups are drawn where PowerPoint puts them, through
+  nested groups and each child's own rotation and flips; tables, charts and
+  metafile pictures inside them turn too. The "rotated groups are drawn
+  unrotated" warning is gone.
+- The whole DrawingML preset shape catalogue (187 shapes, `src/presets.rs`):
+  arrows, callouts, stars, flow-chart symbols, math symbols, brackets,
+  wedges and the rest. About 60 were drawn before and the others fell back
+  to a rectangle.
+- SmartArt saved without its drawing (files from LibreOffice, Google Slides,
+  python-pptx, older Office) is laid out from the data model: vertical and
+  horizontal lists, process, cycle, radial, hierarchy with assistants, matrix,
+  and a list fallback for other layouts, with the diagram's colours. Reported
+  as "SmartArt laid out by slidepdf, not PowerPoint" instead of skipped.
+- Embedded objects without a preview picture are drawn instead of skipped:
+  the embedded file itself when it is a picture, the chart of an embedded
+  Excel workbook, or a translucent grey placeholder labelled with the
+  object's type so the slide keeps its layout (reported as "embedded <type>
+  drawn as a placeholder"). Embedded workbooks count against the deck's
+  inflate budget.
+- Characters outside WinAnsi (Greek, Cyrillic, arrows...) in a typeface that
+  is not registered are drawn with any registered font that has the glyph
+  (same slant first, then the nearest weight), so one broad font such as
+  Noto Sans covers every typeface. Latin text keeps the base-14 fonts.
+- A real-deck regression test: `tests/corpus.rs` converts the LibreOffice and
+  Apache POI PPTX corpora (539 decks, fetched by `scripts/corpus.sh`) and
+  compares every deck's outcome and warning kinds with
+  `tests/corpus-baseline.json`; a GitHub Actions job runs it on every pull
+  request.
+- Demo API: `GET /metrics` in Prometheus format (conversions by outcome,
+  duration and peak-memory histograms, pool gauges, queue depth) and
+  conversions deduplicated by the SHA-256 of the upload: a deck already being
+  converted joins the running job, finished results live in an on-disk LRU
+  (`CACHE_MB`, `CACHE_DIR`), and every response says `X-Slidepdf-Cache:
+  hit | miss | joined`.
+
+### Fixed
+
+- Line widths are no longer scaled with a group's scale: PowerPoint keeps
+  them absolute, and legacy groups (child space in old master units) came
+  out as black blobs.
+- Greyscale photos saved as PNG are stored as JPEG too; the "many colours"
+  test could never pass with 256 grey levels.
+- A variable font whose `wght` range holds no standard weight (410..490)
+  keeps one instance at the axis default instead of disappearing.
+
 ## [0.4.0] - 2026-11-07
 
 Fidelity and size release: decks made of photos and brand fonts come out
